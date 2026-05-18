@@ -1,0 +1,39 @@
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+node_modules
+dist
+dist-ssr
+*.local
+
+# Miljöfiler — aldrig committa nycklar
+.env
+.env.*
+
+# Editor directories and files
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# Tauri update signing keys
+sagt-updater.key
+sagt-updater.key.pub
+
+# Tauri build artifacts and sidecar binaries (fetched in CI)
+src-tauri/target/
+src-tauri/binaries/
+src-tauri/resources/models/
+src-tauri/gen/
+src-tauri/whisper_temp/
