@@ -4,6 +4,8 @@
 
 [Download for Windows →](https://downloads.sagt.ai/Sagt.ai-setup.exe) | [sagt.ai](https://sagt.ai)
 
+![Sagt.ai Desktop — real-time Swedish transcription](assets/screenshot.png)
+
 ---
 
 > **Early access:** This is a public beta. Expect rough edges. If something breaks, [open an issue](../../issues) — we read every one.
