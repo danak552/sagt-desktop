@@ -1,0 +1,49 @@
+# Secrets-free CI — typecheck + compile check only.
+#
+# This repository is a source mirror for auditability. It intentionally has
+# NO release pipeline and NO secrets: official binaries are built and signed
+# (Azure Trusted Signing) in the maintainers' release pipeline and published
+# at https://downloads.sagt.ai. See README → "Releases & build provenance".
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+jobs:
+  typecheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npx tsc --noEmit
+
+  cargo-check:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      # The whisper sidecar, model and frontend dist are not part of this
+      # repository (see README). Tauri's build script validates that the
+      # externalBin/resources paths exist, so create empty placeholders —
+      # cargo check never executes them.
+      - name: Mock sidecar resources
+        run: |
+          New-Item -ItemType Directory -Force -Path src-tauri/binaries, src-tauri/resources/models, dist | Out-Null
+          New-Item -ItemType File -Force -Path src-tauri/binaries/whisper-cli-x86_64-pc-windows-msvc.exe | Out-Null
+          New-Item -ItemType File -Force -Path src-tauri/binaries/whisper.dll | Out-Null
+          New-Item -ItemType File -Force -Path src-tauri/resources/models/ggml-kb-whisper-small.bin | Out-Null
+          New-Item -ItemType File -Force -Path dist/index.html | Out-Null
+
+      - name: cargo check
+        working-directory: src-tauri
+        run: cargo check --locked

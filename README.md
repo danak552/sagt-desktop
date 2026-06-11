@@ -46,12 +46,17 @@ During local transcription, the app makes zero external network calls. You can v
 
 The app auto-updates in the background when a new version is available.
 
+## Releases & build provenance
+
+This repository is the **source mirror** for the desktop app — it exists so you can audit exactly what the app does. It is synced at every release and tagged with the same version as the official installer.
+
+Official binaries are built, code-signed (Azure Trusted Signing) and published from the maintainers' release pipeline — **not** from this repository. By design, this repo contains **no release credentials, no signing keys and no publishing pipeline**; its CI only typechecks and compiles the code. This keeps the attack surface of the public repo at zero while the code stays fully reviewable.
+
 ## Build from source
 
 Prerequisites: [Rust toolchain](https://rustup.rs) and [Node.js 20+](https://nodejs.org).
 
 ```bash
-cd desktop
 npm install
 cp .env.example .env   # fill in your values
 npm run tauri:dev      # opens the app with DevTools (F12) enabled
