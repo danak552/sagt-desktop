@@ -4,7 +4,7 @@
 
 [Download for Windows →](https://downloads.sagt.ai/Sagt.ai-setup.exe) | [sagt.ai](https://sagt.ai)
 
-**Current version: v0.9.30** — switching microphone in Settings now rebinds the live capture stream (previously a silent no-op while the engine was running); the mic also follows Windows default-device changes, recovers from same-name replug, and re-binds to your selected device when it reappears after a fallback — with a clear error toast if the rebind fails.
+**Current version: v0.9.31** — the in-app updater is now fully visible: a single toast shows download progress (percent and MB), an "Installing — restarting automatically" notice, and a retry button on network errors. Updating is blocked while a recording is in progress, so the installer can never cut a recording short.
 
 ![Sagt.ai Desktop — real-time Swedish transcription](assets/screenshot.png)
 
