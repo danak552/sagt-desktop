@@ -20,6 +20,9 @@ dist-ssr
 src-tauri/icons/android/
 src-tauri/icons/ios/
 
+# whisper.cpp-exempelbinärer — används inte av appen (sidecar ligger i src-tauri/binaries/)
+src-tauri/whisper_temp/
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json

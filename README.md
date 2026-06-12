@@ -4,7 +4,7 @@
 
 [Download for Windows →](https://downloads.sagt.ai/Sagt.ai-setup.exe) | [sagt.ai](https://sagt.ai)
 
-**Current version: v0.9.29** — meeting audio now follows Windows output-device changes (e.g. USB-C headset plug/unplug) with self-healing capture and a warning when no system audio is detected; storage management with disk usage + automatic audio cleanup (transcripts kept); clearer recordings view with per-dimension status columns.
+**Current version: v0.9.30** — switching microphone in Settings now rebinds the live capture stream (previously a silent no-op while the engine was running); the mic also follows Windows default-device changes, recovers from same-name replug, and re-binds to your selected device when it reappears after a fallback — with a clear error toast if the rebind fails.
 
 ![Sagt.ai Desktop — real-time Swedish transcription](assets/screenshot.png)
 

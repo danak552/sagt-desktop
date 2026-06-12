@@ -142,7 +142,7 @@ export function SettingsPage() {
                                 ))}
                             </select>
                             <p className="text-xs text-muted-foreground">
-                                Välj rätt mikrofon för att undvika tystnad. Ändring startar om ljudmotorn.
+                                Välj rätt mikrofon för att undvika tystnad. Bytet tar effekt inom ett par sekunder.
                             </p>
                         </div>
 

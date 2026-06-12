@@ -139,6 +139,9 @@ pub struct AudioMonitor {
     is_recording: Arc<Mutex<bool>>,
     pub settings: Arc<Mutex<AudioSettings>>,
     session_state: Arc<Mutex<SessionState>>,
+    /// Önskad mic-enhet (None = systemets default). Sätts av init_audio_engine och
+    /// plockas upp av huvudloopens 2 s-poll — enhetsbyte kräver ingen motoromstart.
+    desired_mic: Arc<Mutex<Option<String>>>,
 }
 
 #[derive(Serialize)]
@@ -160,6 +163,7 @@ impl AudioMonitor {
                 pending_transcriptions: 0,
                 duration_sec: 0.0,
             })),
+            desired_mic: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -199,9 +203,13 @@ impl AudioMonitor {
 
     pub fn start(&self, app: AppHandle, input_device_name: Option<String>) -> Result<(), String> {
         println!("DEBUG: Entered init_audio_engine with device: {:?}", input_device_name);
+        // Spara önskad enhet FÖRE running-checken: när motorn redan kör är detta hela
+        // jobbet — huvudloopens 2 s-poll binder om mic-strömmen mot den nya enheten.
+        // (Tidigare var enhetsbyte vid körande motor en tyst no-op.)
+        *self.desired_mic.lock().unwrap() = input_device_name;
         let mut running = self.is_running.lock().unwrap();
         if *running {
-            println!("DEBUG: Audio engine already running");
+            println!("DEBUG: Audio engine already running — mic rebind via main loop poll");
             return Ok(());
         }
         *running = true;
@@ -209,6 +217,7 @@ impl AudioMonitor {
         let is_recording = self.is_recording.clone(); // Clone for threads
         let settings = self.settings.clone();
         let session_state = self.session_state.clone();
+        let desired_mic = self.desired_mic.clone();
 
         thread::spawn(move || {
             let host = cpal::default_host();
@@ -245,60 +254,17 @@ impl AudioMonitor {
             });
 
             // --- Microphone Capture ---
-            // Select device based on name or default
-            let mic_device_opt = if let Some(ref name) = input_device_name {
-                let mut found = None;
-                if let Ok(devices) = host.input_devices() {
-                    for d in devices {
-                        if let Ok(d_name) = d.name() {
-                            if d_name == *name {
-                                found = Some(d);
-                                break;
-                            }
-                        }
-                    }
-                }
-                found.or_else(|| {
-                    println!("DEBUG: Requested device not found, falling back to default");
-                    host.default_input_device()
-                })
-            } else {
-                host.default_input_device()
+            // Fail-loud vid motorstart: ingen mic alls → audio-error + motorn dör (en
+            // senare init_audio_engine försöker igen). Därefter sköts enhetsbyten,
+            // WASAPI-invalidering och självläkning av mic-rebind i huvudloopen nedan.
+            let initial_mic = desired_mic.lock().unwrap().clone();
+            let mut mic_capture = match build_mic_capture(
+                &host, &app, &level_tx, &session_tx, &settings, &is_recording, &session_state,
+                initial_mic,
+            ) {
+                Ok(c) => Some(c),
+                Err(e) => fail!(e),
             };
-            let mic_device = match mic_device_opt {
-                Some(d) => d,
-                None => fail!("Ingen mikrofon hittades. Anslut en mikrofon och försök igen."),
-            };
-
-            println!("DEBUG: Selected input device: {:?}", mic_device.name().unwrap_or_default());
-
-            let mic_config = match mic_device.default_input_config() {
-                Ok(c) => c,
-                Err(e) => fail!(format!("Kunde inte läsa mikrofonens konfiguration: {}", e)),
-            };
-            let app_handle_mic = app.clone();
-            let (mic_sample_tx, mic_sample_rx) = unbounded::<f32>();
-            
-            let mic_sample_rate = mic_config.sample_rate().0;
-            let mic_level_tx = level_tx.clone();
-            let mic_session_tx = session_tx.clone();
-            
-            // Mic skickar ingen felflagga (None): mic-vägen är fail-loud via fail!-makrot
-            // och har ingen rebind-loop — bara sys-loopbacken behöver felsignalen.
-            let mic_stream_res = match mic_config.sample_format() {
-                cpal::SampleFormat::F32 => run_stream::<f32>(&mic_device, &mic_config.clone().into(), mic_sample_tx, None),
-                cpal::SampleFormat::I16 => run_stream::<i16>(&mic_device, &mic_config.clone().into(), mic_sample_tx, None),
-                cpal::SampleFormat::U16 => run_stream::<u16>(&mic_device, &mic_config.clone().into(), mic_sample_tx, None),
-                fmt => fail!(format!("Ljudformatet stöds inte: {:?}", fmt)),
-            };
-            let mic_stream = match mic_stream_res {
-                Ok(s) => s,
-                Err(e) => fail!(format!("Kunde inte skapa mikrofonström: {}", e)),
-            };
-            if let Err(e) = mic_stream.play() {
-                fail!(format!("Kunde inte starta mikrofonström: {}", e));
-            }
-            println!("DEBUG: Mic stream started");
 
             // --- System Loopback Capture ---
             // Loopbacken binds mot den AKTUELLA default-utgången och binds om i huvud-
@@ -308,26 +274,6 @@ impl AudioMonitor {
             let mut sys_capture = build_sys_capture(
                 &host, &app, &level_tx, &session_tx, &settings, &is_recording, &session_state,
             );
-
-            // --- Processing Threads ---
-            let settings_mic = settings.clone();
-            // Clone is_recording for Mic thread
-            let is_recording_mic = is_recording.clone();
-            let session_state_mic = session_state.clone();
-
-            thread::spawn(move || {
-                process_audio_stream(
-                    mic_sample_rx, 
-                    mic_sample_rate, 
-                    "DU", 
-                    app_handle_mic, 
-                    Some((mic_level_tx, true)), 
-                    settings_mic,
-                    Some(("mic".to_string(), mic_session_tx)),
-                    is_recording_mic,
-                    session_state_mic
-                );
-            });
 
              // --- Main Loop: Aggregating Levels & Keeping Alive ---
              let mut current_mic = 0.0;
@@ -345,6 +291,9 @@ impl AudioMonitor {
              // Some(start) medan en inspelning pågår — None däremellan (edge-detektering).
              let mut recording_since: Option<Instant> = None;
              let mut audio_warning_sent = false;
+             // Engångstoast per mic-felepisod (nollställs vid lyckad rebind) —
+             // fail-loud utan att spamma en toast var 2 s medan enheten saknas.
+             let mut mic_error_emitted = false;
 
              loop {
                 if !*is_running.lock().unwrap() {
@@ -389,6 +338,59 @@ impl AudioMonitor {
 
                 if last_device_poll.elapsed() >= Duration::from_secs(2) {
                     last_device_poll = Instant::now();
+
+                    // --- Mic-rebind: enhetsbyte i Inställningar (desired ändrad), WASAPI-
+                    // invalidering (failed-flaggan), default-mic-byte när "Standardenhet"
+                    // är vald, eller självläkning när vald/någon mic dyker upp igen.
+                    // Samma mönster som loopback-rebinden nedan, men fail-loud: misslyckad
+                    // rebind → audio-error-toast; motorn lever vidare och försöker var 2 s.
+                    let desired = desired_mic.lock().unwrap().clone();
+                    let mic_needs_rebind = match &mic_capture {
+                        Some(cap) => {
+                            cap.failed.load(Ordering::SeqCst)
+                                || cap.requested != desired
+                                || match &desired {
+                                    None => host.default_input_device()
+                                        .and_then(|d| d.name().ok())
+                                        .as_deref() != Some(cap.device_name.as_str()),
+                                    // Vald enhet saknades vid bindningen (fallback till
+                                    // default) — bind om så fort den finns igen.
+                                    Some(name) => cap.device_name != *name
+                                        && input_device_exists(&host, name),
+                                }
+                        }
+                        None => true,
+                    };
+                    if mic_needs_rebind {
+                        if let Some(cap) = mic_capture.take() {
+                            println!(
+                                "DEBUG: Rebinding mic (failed={}, old={:?}, desired={:?})",
+                                cap.failed.load(Ordering::SeqCst), cap.device_name, desired
+                            );
+                            // Droppa gamla strömmen FÖRST — aldrig två aktiva mic-strömmar.
+                            // Nedkopplad sample-kanal avslutar gamla processor-tråden, som
+                            // force-flushar sitt pågående VAD-segment.
+                            drop(cap);
+                        }
+                        current_mic = 0.0;
+                        match build_mic_capture(
+                            &host, &app, &level_tx, &session_tx, &settings, &is_recording, &session_state,
+                            desired,
+                        ) {
+                            Ok(cap) => {
+                                println!("DEBUG: Mic rebound to {:?}", cap.device_name);
+                                mic_capture = Some(cap);
+                                mic_error_emitted = false;
+                            }
+                            Err(e) => {
+                                eprintln!("AUDIO ERROR: mic rebind failed: {}", e);
+                                if !mic_error_emitted {
+                                    mic_error_emitted = true;
+                                    let _ = app.emit("audio-error", format!("Mikrofonfel: {}", e));
+                                }
+                            }
+                        }
+                    }
 
                     // Rebind när: strömmen felat (WASAPI invaliderar endpointen vid
                     // same-name-replug), default-utgångens namn ändrats, eller när vi
@@ -492,6 +494,110 @@ impl AudioMonitor {
 // No need for Send wrapper if distinct variable.
 
 
+
+/// Aktiv mic-fångst mot en specifik (eller default-) ingångsenhet. Samma drop-semantik
+/// som SysCapture: droppad ström kopplar ner sample-kanalen, processor-tråden avslutas
+/// och force-flushar pågående VAD-segment.
+struct MicCapture {
+    /// Håller cpal-strömmen vid liv; drop = stoppa fångsten.
+    _stream: cpal::Stream,
+    /// Faktiskt bundet enhetsnamn — jämförs mot aktuell default-ingång var 2 s
+    /// när ingen specifik enhet är vald.
+    device_name: String,
+    /// Enhetsnamnet som begärdes vid bindningen (None = default). Skiljer sig från
+    /// device_name vid fallback — jämförs mot desired_mic så att en fallback inte
+    /// triggar rebind varje poll.
+    requested: Option<String>,
+    /// Sätts av cpal:s error-callback när endpointen invalideras → trigga rebind.
+    failed: Arc<AtomicBool>,
+}
+
+/// Bygger mic-fångsten mot begärd enhet (fallback: default-ingång) och spawnar dess
+/// processor-tråd. Till skillnad från best-effort-build_sys_capture är felvägen Result:
+/// anroparen avgör om felet är fatalt (motorstart → fail!) eller toast + retry var 2 s
+/// (rebind i huvudloopen) — mic-vägen är alltid fail-loud, aldrig tyst.
+fn build_mic_capture(
+    host: &cpal::Host,
+    app: &AppHandle,
+    level_tx: &Sender<AudioInput>,
+    session_tx: &Sender<SessionChunk>,
+    settings: &Arc<Mutex<AudioSettings>>,
+    is_recording: &Arc<Mutex<bool>>,
+    session_state: &Arc<Mutex<SessionState>>,
+    requested: Option<String>,
+) -> Result<MicCapture, String> {
+    let mic_device_opt = if let Some(ref name) = requested {
+        find_input_device(host, name).or_else(|| {
+            println!("DEBUG: Requested device not found, falling back to default");
+            host.default_input_device()
+        })
+    } else {
+        host.default_input_device()
+    };
+    let mic_device = match mic_device_opt {
+        Some(d) => d,
+        None => return Err("Ingen mikrofon hittades. Anslut en mikrofon och försök igen.".to_string()),
+    };
+    let device_name = mic_device.name().unwrap_or_default();
+    println!("DEBUG: Selected input device: {:?}", device_name);
+
+    let mic_config = mic_device.default_input_config()
+        .map_err(|e| format!("Kunde inte läsa mikrofonens konfiguration: {}", e))?;
+
+    let (mic_sample_tx, mic_sample_rx) = unbounded::<f32>();
+    let mic_sample_rate = mic_config.sample_rate().0;
+    let failed = Arc::new(AtomicBool::new(false));
+
+    // Felflaggan ger mic:en samma same-name-replug-läkning som loopbacken: WASAPI
+    // invaliderar endpointen → error-callback → rebind i huvudloopen.
+    let mic_stream_res = match mic_config.sample_format() {
+        cpal::SampleFormat::F32 => run_stream::<f32>(&mic_device, &mic_config.clone().into(), mic_sample_tx, Some(failed.clone())),
+        cpal::SampleFormat::I16 => run_stream::<i16>(&mic_device, &mic_config.clone().into(), mic_sample_tx, Some(failed.clone())),
+        cpal::SampleFormat::U16 => run_stream::<u16>(&mic_device, &mic_config.clone().into(), mic_sample_tx, Some(failed.clone())),
+        fmt => return Err(format!("Ljudformatet stöds inte: {:?}", fmt)),
+    };
+    let stream = mic_stream_res.map_err(|e| format!("Kunde inte skapa mikrofonström: {}", e))?;
+    stream.play().map_err(|e| format!("Kunde inte starta mikrofonström: {}", e))?;
+    println!("DEBUG: Mic stream started on {:?}", device_name);
+
+    // Processor-tråden får nya enhetens samplerate → korrekt resample-ratio.
+    // Kloner av samma session_tx/level_tx → DU-segment och SessionChunks
+    // fortsätter in i pågående session efter en rebind.
+    let app_handle_mic = app.clone();
+    let settings_mic = settings.clone();
+    let is_recording_mic = is_recording.clone();
+    let session_state_mic = session_state.clone();
+    let mic_level_tx = level_tx.clone();
+    let mic_session_tx = session_tx.clone();
+
+    thread::spawn(move || {
+        process_audio_stream(
+            mic_sample_rx,
+            mic_sample_rate,
+            "DU",
+            app_handle_mic,
+            Some((mic_level_tx, true)),
+            settings_mic,
+            Some(("mic".to_string(), mic_session_tx)),
+            is_recording_mic,
+            session_state_mic,
+        );
+    });
+
+    Ok(MicCapture { _stream: stream, device_name, requested, failed })
+}
+
+/// Hittar ingångsenheten med exakt detta namn, om den finns just nu.
+fn find_input_device(host: &cpal::Host, name: &str) -> Option<cpal::Device> {
+    host.input_devices().ok()?
+        .find(|d| d.name().map(|n| n == name).unwrap_or(false))
+}
+
+/// Finns en ingångsenhet med exakt detta namn just nu? (För självläkning: vald enhet
+/// som saknades vid bindningen binds om så fort den dyker upp igen.)
+fn input_device_exists(host: &cpal::Host, name: &str) -> bool {
+    find_input_device(host, name).is_some()
+}
 
 /// Aktiv WASAPI-loopback mot en specifik utgångsenhet. När strömmen droppas kopplas
 /// sample-kanalen ner, processor-tråden avslutar sin `for sample in rx`-loop och
