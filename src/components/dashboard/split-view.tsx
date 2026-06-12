@@ -1,21 +1,21 @@
 // Removed ScrollArea import
 import { Card } from "@/components/ui/card";
-import { FileText, Sparkles, History, Loader2, Copy, RefreshCw, Play, Cloud, Check, CloudLightning, LogOut } from "lucide-react";
+import { FileText, Sparkles, History, Loader2, Copy, RefreshCw, Play, Cloud, Check, LogOut, Lock } from "lucide-react";
 import { useTranscription } from "@/hooks/use-transcription";
+import { cancelCloudStream } from "@/hooks/use-cloud-stream";
 import { useSyncStore } from "@/store/sync-store";
 import { useSettingsStore } from "@/store/settings-store";
 import { useTranscriptionStore, UISegment } from "@/store/transcription-store";
 import { invoke } from "@tauri-apps/api/core";
 import { useEffect, useRef, useState, useMemo } from "react";
 import { Button } from "@/components/ui/button";
-import { getJob, reanalyzeTranscript, uploadJob } from "@/lib/api";
+import { getJob, reanalyzeTranscript, reanalyzeJob, uploadJob } from "@/lib/api";
+import { applyInlineCloudResult } from "@/lib/cloud-sync";
 import { AnalysisData } from "@/store/sync-store";
 import { useAuthStore } from "@/store/auth-store";
-import { useBrowserAuth } from "@/hooks/use-browser-auth";
 import { toast } from "sonner";
 import { ModePill } from "./mode-pill";
 import { UpsellModal } from "./upsell-modal";
-import { useConfigStore } from "@/store/config-store";
 import { usePaymentRefresh } from "@/hooks/use-payment-refresh";
 import { usePostHogEvents } from "@/hooks/use-posthog-events";
 
@@ -23,14 +23,10 @@ export function SplitView() {
     const isSignedIn = useAuthStore((s) => s.isSignedIn);
     const getToken = useAuthStore((s) => s.getToken);
     const isPro = useAuthStore((s) => s.isPro());
-    const userId = useAuthStore((s) => s.userId);
     const email = useAuthStore((s) => s.email);
     const clearSession = useAuthStore((s) => s.clearSession);
-    const stripePaymentLink = useConfigStore((s) => s.stripePaymentLink);
-    const { startAuth, isAuthenticating } = useBrowserAuth();
     const events = usePostHogEvents();
-    const { isWaiting: isPaymentWaiting, startPolling: startPaymentPolling, stopPolling: stopPaymentPolling, manualRefresh: manualPaymentRefresh } = usePaymentRefresh();
-    const [showLoginModal, setShowLoginModal] = useState(false);
+    const { isWaiting: isPaymentWaiting, stopPolling: stopPaymentPolling } = usePaymentRefresh();
     const [showUpsellModal, setShowUpsellModal] = useState(false);
     const [showUserMenu, setShowUserMenu] = useState(false);
     const userMenuRef = useRef<HTMLDivElement>(null);
@@ -53,12 +49,6 @@ export function SplitView() {
         : "?";
 
     useEffect(() => {
-        if (isSignedIn && showLoginModal) {
-            setShowLoginModal(false);
-        }
-    }, [isSignedIn, showLoginModal]);
-
-    useEffect(() => {
         if (isSignedIn && !isPro) {
             events.upsellShown('ai_insights_panel');
         }
@@ -73,27 +63,108 @@ export function SplitView() {
         uploadedJobId, setUploadedJobId, analysisData, setAnalysisData, processingStatus, setProcessingStatus,
         activeJob, activeJobFromHistory, setActiveJob, resetToLive, reset,
         setTemplateId, setUploadStatus, currentSessionPath, currentSessionId, setErrorMessage, isRecording,
-        effectiveMode
+        effectiveMode, cloudStreamingActive
     } = useSyncStore();
     // Access store actions to populate segments for archive view
     const { setSegments, clearSegments } = useTranscriptionStore();
-    const { recordingMode } = useSettingsStore();
+    const { recordingMode, pauseBreakMs } = useSettingsStore();
+
+    // "Lokalt"-indikatorn ska bara visas som ÄKTA fallback — när molnet var avsett (Pro valde
+    // moln) men inte är aktivt (offline) — aldrig när användaren medvetet valt lokalt läge.
+    // Och endast medan inspelning pågår, så den inte ligger kvar efteråt.
+    const cloudIntended = recordingMode === 'cloud' || recordingMode === 'cloud_analysis';
+    const showLocalFallbackBadge = cloudIntended && !cloudStreamingActive && isRecording;
+
+    // Per-modell-vy: en inspelning kan ha BÅDE lokala segment (Du/Mötet) och ett
+    // molnresultat (KB-Whisper Large i cloud_transcript). Resultaten skriver aldrig
+    // över varandra — användaren växlar vy och ser skillnaden mellan modellerna.
+    const [transcriptView, setTranscriptView] = useState<'local' | 'cloud'>('local');
+    const cloudTranscript: string | null = activeJob?.cloud_transcript?.trim() || null;
+    const hasModelToggle = !!cloudTranscript && rawSegments.length > 0;
 
     // Derive displayed segments synchronously so the first render after a tab switch
     // already shows the cloud result — no flash of stale local segments.
     const segments = useMemo((): UISegment[] => {
-        if (activeJob?.cloud_transcript) {
-            return [{
-                id: -1,
-                start_time: 0,
-                end_time: 0,
-                text: activeJob.cloud_transcript,
-                speaker: "MOLN" as const,
-                timestamp: 0,
-            }];
+        const cloudSeg = (): UISegment[] => [{
+            id: -1,
+            start_time: 0,
+            end_time: 0,
+            text: cloudTranscript!,
+            speaker: "MOLN" as const,
+            timestamp: 0,
+        }];
+        if (hasModelToggle && transcriptView === 'cloud') return cloudSeg();
+        if (rawSegments.length > 0) {
+            // Molnchunks kan slutföras i annan ordning än de talades — sortera på start_time.
+            return [...rawSegments].sort((a, b) => (a.start_time || 0) - (b.start_time || 0));
         }
-        return rawSegments;
-    }, [activeJob?.cloud_transcript, rawSegments]);
+        if (cloudTranscript) return cloudSeg();
+        return [];
+    }, [cloudTranscript, hasModelToggle, transcriptView, rawSegments]);
+
+    // Visa molnresultatet som standard när det finns (bästa modellen) — både vid
+    // återöppning från historiken och när en omtranskribering/auto-synk blir klar.
+    // Manuell växling påverkas inte (deps ändras bara när cloud_transcript byts).
+    useEffect(() => {
+        setTranscriptView(activeJob?.cloud_transcript ? 'cloud' : 'local');
+    }, [activeJob?.id, activeJob?.cloud_transcript]);
+
+    // Sammanhängande-läge: alla segment är "MOLN" → rendera som ETT flöde med styckesbryt
+    // vid pauser (gap mellan segment ≥ pauseBreakMs). Pausbryt härleds ur Rusts VAD-timing.
+    const isMerged = segments.length > 0 && segments.every(s => s.speaker === "MOLN");
+    const mergedParagraphs = useMemo((): string[] => {
+        if (!isMerged) return [];
+        const paras: string[] = [];
+        let cur = "";
+        let prevEnd: number | null = null;
+        for (const s of segments) {
+            const t = s.text.trim();
+            if (!t) continue;
+            if (prevEnd != null && (s.start_time - prevEnd) * 1000 >= pauseBreakMs) {
+                if (cur) paras.push(cur);
+                cur = t;
+            } else {
+                cur = cur ? `${cur} ${t}` : t;
+            }
+            prevEnd = s.end_time || s.start_time;
+        }
+        if (cur) paras.push(cur);
+        return paras;
+    }, [isMerged, segments, pauseBreakMs]);
+
+    // #9: gruppera på varandra följande segment med SAMMA talare till en "tur" (som mockupen
+    // på startsidan): fet "Mötet:"/"Du:" inline + text, ny tur bara vid talarbyte eller paus.
+    const speakerLabel = (sp: string) =>
+        (sp === "mic" || sp === "DU") ? "Du" : (sp === "sys" || sp === "MÖTET") ? "Mötet" : sp;
+    const turns = useMemo(() => {
+        const out: { speaker: string; text: string; start_time: number; end_time: number }[] = [];
+        for (const s of segments) {
+            if (s.text.includes('<|nospeech|>')) continue;
+            const t = s.text.trim();
+            if (!t) continue;
+            const last = out[out.length - 1];
+            const gap = last ? (s.start_time - last.end_time) * 1000 : 0;
+            if (last && last.speaker === s.speaker && gap < pauseBreakMs) {
+                last.text += " " + t;
+                last.end_time = s.end_time || s.start_time;
+            } else {
+                out.push({ speaker: s.speaker, text: t, start_time: s.start_time, end_time: s.end_time || s.start_time });
+            }
+        }
+        return out;
+    }, [segments, pauseBreakMs]);
+
+    // Kopiera EXAKT det som visas i vyn: samma turer (gruppering per talare) som renderas,
+    // inte ett prefix per råsegment/mening. Merged-läget kopierar styckena.
+    const buildCopyText = (): string => {
+        if (isMerged) return mergedParagraphs.join("\n\n");
+        return turns
+            .map(turn => {
+                const label = turn.speaker === "MOLN" ? "" : speakerLabel(turn.speaker);
+                return label ? `${label}: ${turn.text}` : turn.text;
+            })
+            .join("\n\n");
+    };
 
     useEffect(() => {
         if (scrollRef.current) {
@@ -127,6 +198,8 @@ export function SplitView() {
         setIsReanalyzing(false);
         setUploadStatus('idle');
         setUploadedJobId(null);
+        // #11: töm moln-kön också — annars fortsätter buffrade chunks att POSTas och text dimpa in.
+        cancelCloudStream();
         useTranscriptionStore.getState().setIsProcessing(false);
         try {
             // Kill the active whisper-cli child process in Rust
@@ -142,9 +215,12 @@ export function SplitView() {
     };
 
     const handleRetranscribe = async () => {
-        if (!isSignedIn) { setShowLoginModal(true); return; }
-        if (!isPro) { setShowUpsellModal(true); return; }
+        if (!isSignedIn || !isPro) { setShowUpsellModal(true); return; }
         if (!navigator.onLine) { toast.error("Denna funktion kräver internetanslutning."); return; }
+        if (activeJob?.audio_deleted) {
+            toast.error("Ljudfilen är raderad — molntranskribering kräver ljudet. Transkript och analys finns kvar.");
+            return;
+        }
 
         const uploadPath = activeJob?.file_path || currentSessionPath;
         if (!uploadPath) {
@@ -160,9 +236,17 @@ export function SplitView() {
         try {
             const job = await uploadJob(uploadPath, "general", token, true);
             setUploadStatus('success');
-            setUploadedJobId(job.id);
-            setProcessingStatus("PROCESSING");
-            toast.success("Transkriberar med KB-Whisper Large...");
+            if (useSettingsStore.getState().cloudSync) {
+                setUploadedJobId(job.id);
+                setProcessingStatus("PROCESSING");
+                toast.success("Transkriberar med KB-Whisper Large...");
+            } else {
+                const dbId = activeJob?.id ?? (currentSessionId ? parseInt(currentSessionId) : null);
+                const wc = await applyInlineCloudResult(job, dbId);
+                events.cloudSyncCompleted(wc);
+                setTranscriptView('cloud'); // visa det nya molnresultatet direkt
+                toast.success("Transkriberad med KB-Whisper Large (resultat endast lokalt).");
+            }
         } catch (error: any) {
             setUploadStatus('error');
             setUploadedJobId(null);
@@ -183,12 +267,7 @@ export function SplitView() {
             return;
         }
 
-        if (!isSignedIn) {
-            setShowLoginModal(true);
-            return;
-        }
-
-        if (!isPro) {
+        if (!isSignedIn || !isPro) {
             setShowUpsellModal(true);
             return;
         }
@@ -208,13 +287,20 @@ export function SplitView() {
             setIsReanalyzing(true);
             try {
                 const fullText = segments.map(s => s.text).join(" ");
-                const newResult = await reanalyzeTranscript(fullText, "general", token);
+
+                // Synkat moln-jobb → kör om i molnet (job.analysis uppdateras → dashboard matchar
+                // desktop). Osynkat/lokalt → stateless analys på den visade texten.
+                // OBS: activeJob kan vara null direkt efter stopp (history-updated ej landad) —
+                // segmenten finns redan, så analysera texten statelesst i det fallet.
+                const raw = (activeJob?.cloud_job_id && useSettingsStore.getState().cloudSync)
+                    ? ((await reanalyzeJob(activeJob.cloud_job_id, "general", token)).analysis || {})
+                    : await reanalyzeTranscript(fullText, "general", token);
 
                 const mappedAnalysis = {
-                    summary: newResult.summary || "",
-                    decisions: newResult.key_decisions || [],
-                    actions: newResult.action_items || [],
-                    template_used: newResult.template_used || "general"
+                    summary: raw.summary || "",
+                    decisions: raw.key_decisions || [],
+                    actions: raw.action_items || [],
+                    template_used: raw.template_used || "general"
                 };
 
                 setAnalysisData(mappedAnalysis as AnalysisData);
@@ -222,18 +308,22 @@ export function SplitView() {
                 // Stop polling so it doesn't overwrite this re-analysis result
                 setUploadedJobId(null);
 
-                await invoke("save_analysis_to_db", {
-                    id: activeJob.id,
-                    analysis: JSON.stringify(mappedAnalysis),
-                    template: "general"
-                });
+                // Persistens kräver en sparad inspelning — hoppa över tyst om activeJob
+                // saknas (analysen visas ändå; sparas när inspelningen öppnas/synkas).
+                if (activeJob?.id) {
+                    await invoke("save_analysis_to_db", {
+                        id: activeJob.id,
+                        analysis: JSON.stringify(mappedAnalysis),
+                        template: "general"
+                    });
 
-                const updatedJob = {
-                    ...activeJob,
-                    analysis_json: JSON.stringify(mappedAnalysis),
-                    ai_template_used: "general"
-                };
-                setActiveJob(updatedJob);
+                    const updatedJob = {
+                        ...activeJob,
+                        analysis_json: JSON.stringify(mappedAnalysis),
+                        ai_template_used: "general"
+                    };
+                    setActiveJob(updatedJob);
+                }
                 setTemplateId("general"); // Ensure global store is updated
                 console.log("Analys uppdaterad!");
             } catch (e: any) {
@@ -249,6 +339,10 @@ export function SplitView() {
             }
         } else {
             // Initial Sync
+            if (activeJob?.audio_deleted) {
+                toast.error("Ljudfilen är raderad — molnsynk kräver ljudet. Transkript och analys finns kvar.");
+                return;
+            }
             const uploadPath = activeJob ? activeJob.file_path : currentSessionPath;
 
             /**
@@ -271,27 +365,28 @@ export function SplitView() {
 
                 const targetDbId = activeJob ? activeJob.id : (currentSessionId ? parseInt(currentSessionId) : null);
 
-                if (targetDbId) {
-                    try {
-                        await invoke("update_recording_status", {
-                            id: targetDbId,
-                            status: 'uploaded',
-                            cloudJobId: job.id
-                        });
-                        console.log("Updated DB status to uploaded for id:", targetDbId);
-
-                        if (activeJob) {
-                            setActiveJob({
-                                ...activeJob,
-                                sync_status: 'uploaded',
-                                cloud_job_id: job.id
+                if (useSettingsStore.getState().cloudSync) {
+                    // Synk PÅ → persistera + polla (visas i dashboard)
+                    if (targetDbId) {
+                        try {
+                            await invoke("update_recording_status", {
+                                id: targetDbId,
+                                status: 'uploaded',
+                                cloudJobId: job.id
                             });
+                            if (activeJob) {
+                                setActiveJob({ ...activeJob, sync_status: 'uploaded', cloud_job_id: job.id });
+                            }
+                        } catch (e) {
+                            console.error("Failed to update DB status:", e);
                         }
-                    } catch (e) {
-                        console.error("Failed to update DB status:", e);
                     }
+                    setUploadedJobId(job.id);
+                } else {
+                    // Synk AV (default, privacy-first) → inline-resultat, inget sparas i molnet
+                    const wc = await applyInlineCloudResult(job, targetDbId);
+                    events.cloudSyncCompleted(wc);
                 }
-                setUploadedJobId(job.id);
             } catch (error: any) {
                 console.error("Upload failed", error);
                 setUploadStatus('error');
@@ -320,31 +415,37 @@ export function SplitView() {
                 setTemplateId("general");
             }
 
-            if (activeJob.cloud_transcript) {
-                setSegments([{
-                    id: -1,
-                    start_time: 0,
-                    end_time: 0,
-                    text: activeJob.cloud_transcript,
-                    speaker: "MOLN",
-                    timestamp: Date.now(),
-                }]);
-                return;
-            }
-
+            // #14: hämta diariserade DB-segment FÖRST; batch-blobben (cloud_transcript) är
+            // bara fallback när inga segment finns — så strömmade inspelningar behåller
+            // Du/Mötet-layouten även efter synk.
             invoke<any[]>("get_recording_segments", { recordingId: activeJob.id })
-                .then(segments => {
+                .then(dbSegments => {
                     const currentActiveJob = useSyncStore.getState().activeJob;
                     if (!currentActiveJob && !uploadedJobId) return;
-                    const uiSegments = segments.map(s => ({
-                        ...s,
-                        timestamp: s.start_time * 1000
-                    }));
-                    setSegments(uiSegments);
+                    const storeSegs = useTranscriptionStore.getState().segments;
+                    const sid = useSyncStore.getState().currentSessionId;
+                    const isCurrentSession = !!sid && String(activeJob.id) === sid;
+                    if (dbSegments.length > 0) {
+                        // #12: DB kan ligga efter live-storen medan sena chunks persisteras —
+                        // skriv aldrig över en fylligare live-vy med en partiell DB-lista.
+                        if (isCurrentSession && dbSegments.length < storeSegs.length) return;
+                        setSegments(dbSegments.map(s => ({
+                            ...s,
+                            timestamp: s.start_time * 1000
+                        })));
+                    } else if (isCurrentSession && storeSegs.length > 0) {
+                        return; // DB tom men live har text (persist ej klar) — behåll live-vyn
+                    } else {
+                        // Ingen lokal text för denna inspelning — töm storen så föregående
+                        // inspelnings segment inte ligger kvar. Ett ev. molnresultat visas
+                        // via cloud_transcript-fallbacken i segments-memon, INTE via storen
+                        // (annars tror modellväxlaren att det finns två olika resultat).
+                        clearSegments();
+                    }
                 })
                 .catch(err => {
                     console.error("Failed to load segments:", err);
-                    setSegments([]);
+                    if (useTranscriptionStore.getState().segments.length === 0) setSegments([]);
                 });
         } else {
             clearSegments();
@@ -421,15 +522,20 @@ export function SplitView() {
                     // Stop polling — prevents future intervals from overwriting re-analysis
                     setUploadedJobId(null);
                     if (cloudText && cloudText.trim()) {
-                        const cloudSegment: UISegment = {
-                            id: -1,
-                            start_time: 0,
-                            end_time: 0,
-                            text: cloudText.trim(),
-                            speaker: "MOLN", // Special marker: cloud-sourced
-                            timestamp: Date.now(),
-                        };
-                        setSegments([cloudSegment]);
+                        // Skriv ALDRIG över lokala/diariserade segment — molnresultatet visas
+                        // via modellväxlaren (activeJob.cloud_transcript). Endast när inget
+                        // annat resultat finns sätts det direkt som segment (batch-only).
+                        if (useTranscriptionStore.getState().segments.length === 0) {
+                            setSegments([{
+                                id: -1,
+                                start_time: 0,
+                                end_time: 0,
+                                text: cloudText.trim(),
+                                speaker: "MOLN", // Special marker: cloud-sourced
+                                timestamp: Date.now(),
+                            }]);
+                        }
+                        setTranscriptView('cloud');
                     }
 
                     // Save to Local DB
@@ -441,6 +547,14 @@ export function SplitView() {
                                 analysis: JSON.stringify(completedAnalysis),
                                 template: completedAnalysis.template_used || "general"
                             });
+                            // Persistera molnresultatet i sqlite — överlever omstart och
+                            // gör att modellväxlaren fungerar när inspelningen återöppnas.
+                            if (cloudText && cloudText.trim()) {
+                                await invoke("save_cloud_transcript_to_db", {
+                                    id: currentActiveJob.id,
+                                    transcript: cloudText.trim(),
+                                });
+                            }
 
                             // Persist cloud_transcript so segments survive tab switches
                             const updatedJob = {
@@ -480,12 +594,12 @@ export function SplitView() {
     };
 
     return (
-        <div className="grid grid-cols-5 h-full overflow-hidden bg-slate-50/50">
+        <div className="grid grid-cols-5 h-full overflow-hidden bg-paper-dim/50">
             {/* Left: Live Transcription (60% -> 3/5 cols) */}
-            <div className="col-span-3 flex flex-col h-full overflow-hidden min-w-0 bg-white border-r border-slate-200/60 shadow-[4px_0_24px_-12px_rgba(0,0,0,0.1)] z-10 relative">
-                <div className="px-8 py-6 flex-none flex justify-between items-center bg-white border-b border-slate-100 z-50">
-                    <h2 className="text-xl font-semibold tracking-tight flex items-center gap-2.5 text-slate-900">
-                        <div className="p-1.5 bg-indigo-50 rounded-lg text-indigo-600">
+            <div className="col-span-3 flex flex-col h-full overflow-hidden min-w-0 bg-white border-r border-line/60 shadow-[4px_0_24px_-12px_rgba(0,0,0,0.1)] z-10 relative">
+                <div className="px-8 py-6 flex-none flex justify-between items-center bg-white border-b border-line z-50">
+                    <h2 className="text-xl font-semibold tracking-tight flex items-center gap-2.5 text-ink">
+                        <div className="p-1.5 bg-brand/5 rounded-lg text-brand">
                             <FileText className="w-4 h-4" />
                         </div>
                         Transkription
@@ -493,20 +607,22 @@ export function SplitView() {
                             <Button
                                 variant="ghost"
                                 size="icon"
-                                className="h-6 w-6 text-slate-400 hover:text-slate-600 ml-1 rounded-full"
-                                onClick={(e) => handleCopy(segments.map(s => s.text).join(" "), "transcript", e)}
+                                className="h-6 w-6 text-ink-muted hover:text-ink-soft ml-1 rounded-full"
+                                onClick={(e) => handleCopy(buildCopyText(), "transcript", e)}
                                 title="Kopiera transkription"
                             >
                                 {copiedKey === "transcript" ? <Check className="h-3.5 w-3.5 text-green-500" /> : <Copy className="h-3.5 w-3.5" />}
                             </Button>
                         )}
-                        {/* Re-transcribe with Large — shown when cloud mode is selected, not currently recording/processing */}
+                        {/* Re-transcribe with Large — shown when cloud mode is selected, not currently recording/processing.
+                            Döljs när ljudfilen är gallrad (auto-gallring) — uppladdningen kräver WAV:en. */}
                         {segments.length > 0 && !isRecording && !uploadedJobId && !isRetranscribing &&
+                         !activeJob?.audio_deleted &&
                          (recordingMode === 'cloud' || recordingMode === 'cloud_analysis') && (
                             <Button
                                 variant="ghost"
                                 size="icon"
-                                className="h-6 w-6 text-slate-400 hover:text-purple-600 hover:bg-purple-50 ml-0.5 rounded-full"
+                                className="h-6 w-6 text-ink-muted hover:text-brand hover:bg-brand/5 ml-0.5 rounded-full"
                                 onClick={handleRetranscribe}
                                 title={segments.some(s => s.speaker === 'MOLN') ? "Transkribera om med KB-Whisper Large" : "Transkribera med KB-Whisper Large"}
                             >
@@ -522,12 +638,12 @@ export function SplitView() {
                     </div>
                 </div>
 
-                <div className="flex-1 overflow-y-auto min-h-0 [&::-webkit-scrollbar]:w-1.5 [&::-webkit-scrollbar-track]:bg-transparent [&::-webkit-scrollbar-thumb]:bg-slate-200 [&::-webkit-scrollbar-thumb]:rounded-full">
+                <div className="flex-1 overflow-y-auto min-h-0 [&::-webkit-scrollbar]:w-1.5 [&::-webkit-scrollbar-track]:bg-transparent [&::-webkit-scrollbar-thumb]:bg-line [&::-webkit-scrollbar-thumb]:rounded-full">
                     <div className="p-8 pt-4 max-w-3xl mx-auto space-y-8">
                         {/* History Banner — only shown when user explicitly opened a recording from history */}
                         {activeJob && activeJobFromHistory && (
-                            <div className="bg-slate-100 border border-slate-200 rounded-lg px-4 py-2.5 flex items-center justify-between animate-in fade-in slide-in-from-top-2">
-                                <div className="flex items-center gap-2 text-slate-600">
+                            <div className="bg-paper-dim border border-line rounded-lg px-4 py-2.5 flex items-center justify-between animate-in fade-in slide-in-from-top-2">
+                                <div className="flex items-center gap-2 text-ink-soft">
                                     <History className="w-4 h-4 flex-shrink-0" />
                                     <span className="text-sm">
                                         {(() => {
@@ -540,7 +656,7 @@ export function SplitView() {
                                     </span>
                                 </div>
                                 <button
-                                    className="text-xs text-slate-400 hover:text-slate-700 transition-colors ml-4"
+                                    className="text-xs text-ink-muted hover:text-ink-soft transition-colors ml-4"
                                     onClick={() => {
                                         reset();
                                         resetToLive();
@@ -552,60 +668,97 @@ export function SplitView() {
                             </div>
                         )}
 
+                        {/* Modellväxlare — visas när inspelningen har resultat från BÅDA
+                            modellerna (lokala segment + KB-Whisper Large) så användaren kan
+                            jämföra och se värdet av Pro. */}
+                        {hasModelToggle && (
+                            <div className="flex items-center gap-1.5">
+                                <button
+                                    onClick={() => setTranscriptView('local')}
+                                    className={`text-[10px] font-bold tracking-widest uppercase px-2 py-0.5 rounded-md border transition-colors ${
+                                        transcriptView === 'local'
+                                            ? 'bg-paper-dim text-ink-soft border-line'
+                                            : 'bg-transparent text-ink-muted border-transparent hover:text-ink-soft'
+                                    }`}
+                                >
+                                    🖥 Lokal
+                                </button>
+                                <button
+                                    onClick={() => setTranscriptView('cloud')}
+                                    className={`text-[10px] font-bold tracking-widest uppercase px-2 py-0.5 rounded-md border transition-colors ${
+                                        transcriptView === 'cloud'
+                                            ? 'bg-brand/5 text-brand border-brand/10'
+                                            : 'bg-transparent text-ink-muted border-transparent hover:text-brand'
+                                    }`}
+                                >
+                                    ☁ KB-Whisper Large
+                                </button>
+                            </div>
+                        )}
+
                         {!activeJob && segments.length === 0 ? (
                             <div className="flex flex-col items-center justify-center h-[50vh] text-center space-y-4 animate-in fade-in duration-1000">
                                 <>
-                                        <div className={`p-4 rounded-full bg-slate-100 ${isRecording ? "opacity-100" : "opacity-40"}`}>
-                                            <Sparkles className={`w-8 h-8 ${isRecording ? "text-red-400 animate-pulse" : "text-slate-400"}`} />
+                                        <div className={`p-4 rounded-full bg-paper-dim ${isRecording ? "opacity-100" : "opacity-40"}`}>
+                                            <Sparkles className={`w-8 h-8 ${isRecording ? "text-red-400 animate-pulse" : "text-ink-muted"}`} />
                                         </div>
                                         <div className={`space-y-1 ${isRecording ? "opacity-100" : "opacity-40"}`}>
-                                            <p className="text-slate-900 font-medium">
-                                                {isRecording ? "🔴 Lyssnar och transkriberar lokalt..." : "Redo för mötet"}
-                                            </p>
-                                            <p className="text-sm text-slate-500 max-w-xs mx-auto">
+                                            <p className="text-ink font-medium">
                                                 {isRecording
-                                                    ? "Genererar ljudutskrift..."
+                                                    ? (cloudStreamingActive ? "🔴 Lyssnar — transkriberar i molnet..." : "🔴 Lyssnar — transkriberar lokalt...")
+                                                    : "Redo för mötet"}
+                                            </p>
+                                            <p className="text-sm text-ink-muted max-w-xs mx-auto">
+                                                {isRecording
+                                                    ? "Texten visas här om en liten stund."
                                                     : "Starta inspelningen för att se transkribering i realtid."}
                                             </p>
                                         </div>
                                     </>
                             </div>
+                        ) : isMerged ? (
+                            // Sammanhängande (1×): ett flöde, styckesbryt vid pauser
+                            <div className="space-y-4 animate-in fade-in duration-500">
+                                {/* Badge redundant när modellväxlaren redan visar källan */}
+                                {!hasModelToggle && (
+                                    <span className="inline-block text-[10px] font-bold tracking-widest uppercase px-2 py-0.5 rounded-md bg-brand/5 text-brand border border-brand/10">
+                                        ☁ KB-Whisper Large
+                                    </span>
+                                )}
+                                {mergedParagraphs.map((para, i) => (
+                                    <p key={i} className="leading-relaxed text-[15px] pl-1 border-l-2 border-brand/20 text-ink">
+                                        {para}
+                                    </p>
+                                ))}
+                            </div>
                         ) : (
-                            segments
-                                .filter(segment => !segment.text.includes('<|nospeech|>'))
-                                .map((segment, index) => (
-                                    <div key={index} className="group flex flex-col gap-2 animate-in fade-in slide-in-from-bottom-2 duration-500 fill-mode-backwards" style={{ animationDelay: `${index * 50}ms` }}>
-                                        <div className="flex items-center gap-2">
-                                            {segment.speaker === "MOLN" ? (
-                                                <span className="text-[10px] font-bold tracking-widest uppercase px-2 py-0.5 rounded-md bg-purple-50 text-purple-600 border border-purple-100">
-                                                    ☁ KB-Whisper Large
+                            <div className="space-y-0">
+                                {showLocalFallbackBadge && (
+                                    <span className="inline-block text-[10px] font-medium px-2 py-0.5 rounded-md bg-paper-dim text-ink-muted border border-line mb-3">
+                                        🖥 Lokalt (molnet ej tillgängligt)
+                                    </span>
+                                )}
+                                {turns.map((turn, index, arr) => {
+                                    // Pausbryt: extra luft när gapet till föregående tur ≥ pauseBreakMs.
+                                    const prev = arr[index - 1];
+                                    const pauseBreak = !!prev && (turn.start_time - prev.end_time) * 1000 >= pauseBreakMs;
+                                    const isDu = turn.speaker === "DU" || turn.speaker === "mic";
+                                    const isMoln = turn.speaker === "MOLN";
+                                    return (
+                                        <p
+                                            key={index}
+                                            className={`leading-relaxed text-[15px] animate-in fade-in slide-in-from-bottom-1 duration-500 fill-mode-backwards ${pauseBreak ? 'mt-5' : 'mt-1.5'}`}
+                                        >
+                                            {!isMoln && (
+                                                <span className={`font-semibold ${isDu ? "text-brand" : "text-rose-600"}`}>
+                                                    {speakerLabel(turn.speaker)}:{" "}
                                                 </span>
-                                            ) : (
-                                            <>
-                                            <span className={`text-[10px] font-bold tracking-widest uppercase px-2 py-0.5 rounded-md ${segment.speaker === "DU" || segment.speaker === "mic"
-                                                ? "bg-indigo-50 text-indigo-600 border border-indigo-100"
-                                                : "bg-rose-50 text-rose-600 border border-rose-100"
-                                                }`}>
-                                                {segment.speaker === "mic" ? "DU" : segment.speaker === "sys" ? "MÖTET" : segment.speaker}
-                                            </span>
-                                            <span className="text-[10px] font-medium px-2 py-0.5 rounded-md bg-slate-50 text-slate-400 border border-slate-100">
-                                                🖥 KB-Whisper Small
-                                            </span>
-                                            </>
                                             )}
-                                        <span className="text-[10px] text-slate-300 font-mono opacity-0 group-hover:opacity-100 transition-opacity">
-                                                {segment.speaker !== "MOLN" && new Date(segment.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })}
-                                            </span>
-                                        </div>
-                                        <p className={`leading-relaxed text-[15px] pl-1 border-l-2 transition-all ${
-                                            segment.speaker === "MOLN"
-                                              ? "text-slate-800 border-purple-200 group-hover:border-purple-300"
-                                              : "text-slate-700 border-transparent group-hover:border-slate-100"
-                                          }`}>
-                                            {segment.text}
+                                            <span className="text-ink-soft">{turn.text}</span>
                                         </p>
-                                    </div>
-                                ))
+                                    );
+                                })}
+                            </div>
                         )}
                         {/* Live Listening Indicator — shown at bottom of existing segments during recording */}
                         {isRecording && segments.length > 0 && (
@@ -614,29 +767,37 @@ export function SplitView() {
                                     <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-red-400 opacity-75" />
                                     <span className="relative inline-flex rounded-full h-2 w-2 bg-red-500" />
                                 </span>
-                                <span className="text-xs text-slate-400">Lyssnar...</span>
+                                <span className="text-xs text-ink-muted">Lyssnar...</span>
                             </div>
                         )}
                         {/* Cloud Processing Indicator — shown while polling for Berget result */}
                         {!activeJob && !isRecording && processingStatus === 'PROCESSING' && (
                             <div className="flex items-center gap-2 pl-1 mt-2">
-                                <Loader2 className="w-3.5 h-3.5 animate-spin text-purple-500" />
-                                <span className="text-xs text-purple-600 font-medium">{getStatusText()}</span>
+                                <Loader2 className="w-3.5 h-3.5 animate-spin text-brand" />
+                                <span className="text-xs text-brand font-medium">{getStatusText()}</span>
                             </div>
                         )}
+                        {/* GDPR 24h-notice — visas när cloud-synk slutförts */}
+                        {!isRecording && processingStatus === 'COMPLETED' && activeJob?.cloud_job_id && (
+                            <span className="text-[10px] text-ink-muted pl-1 mt-1 block">
+                                ℹ Ljud raderas automatiskt om 24 h (GDPR)
+                            </span>
+                        )}
                         {/* Local Finalizing Indicator */}
-                        {!activeJob && isProcessing && !isRecording && processingStatus !== 'PROCESSING' && (
+                        {/* #11: gata INTE på !activeJob — activeJob sätts direkt vid stopp medan
+                            moln-kön fortfarande processar; indikatorn + Avbryt ska lysa tills klart. */}
+                        {isProcessing && !isRecording && processingStatus !== 'PROCESSING' && (
                             <div className="flex flex-col gap-3 animate-pulse pl-1 mt-4">
                                 <div className="flex items-center gap-2">
-                                    <Loader2 className="w-4 h-4 animate-spin text-indigo-500" />
-                                    <span className="text-xs font-medium text-indigo-600">Slutför transkribering... vänta</span>
+                                    <Loader2 className="w-4 h-4 animate-spin text-brand" />
+                                    <span className="text-xs font-medium text-brand">Slutför transkribering... vänta</span>
                                 </div>
                                 <div>
                                     <Button
                                         variant="outline"
                                         size="sm"
                                         onClick={handleCancel}
-                                        className="text-xs text-slate-500 hover:text-red-600"
+                                        className="text-xs text-ink-muted hover:text-red-600"
                                     >
                                         Avbryt
                                     </Button>
@@ -649,11 +810,11 @@ export function SplitView() {
             </div>
 
             {/* Right: AI Insights (40% -> 2/5 cols) */}
-            <div className="col-span-2 flex flex-col h-full overflow-hidden bg-slate-50/50 relative">
-                <div className="px-8 py-6 flex-none bg-slate-50 border-b border-slate-100 z-50 flex justify-between items-center">
-                    <h2 className="text-lg font-medium tracking-tight flex items-center gap-2 text-slate-700">
-                        <Sparkles className="w-4 h-4 text-indigo-500" />
-                        AI Insikter
+            <div className="col-span-2 flex flex-col h-full overflow-hidden bg-paper/60 relative">
+                <div className="px-8 py-6 flex-none bg-paper/60 border-b border-line z-50 flex justify-between items-center">
+                    <h2 className="text-lg font-medium tracking-tight flex items-center gap-2 text-ink-soft">
+                        <Sparkles className="w-4 h-4 text-ochre" />
+                        <span className="text-[11px] font-semibold uppercase tracking-widest text-ochre">Protokoll</span>
                     </h2>
 
                     {/* User button */}
@@ -661,16 +822,16 @@ export function SplitView() {
                         <div className="relative" ref={userMenuRef}>
                             <button
                                 onClick={() => setShowUserMenu((v) => !v)}
-                                className="w-8 h-8 rounded-full bg-indigo-600 text-white text-xs font-semibold flex items-center justify-center hover:bg-indigo-700 transition-colors focus:outline-none focus:ring-2 focus:ring-indigo-400 focus:ring-offset-2"
+                                className="w-8 h-8 rounded-full bg-brand text-paper text-xs font-semibold flex items-center justify-center hover:bg-brand-deep transition-colors focus:outline-none focus:ring-2 focus:ring-brand/40 focus:ring-offset-2"
                                 title={email || "Konto"}
                             >
                                 {initials}
                             </button>
                             {showUserMenu && (
-                                <div className="absolute right-0 top-full mt-2 w-56 bg-white rounded-xl shadow-lg border border-slate-200 py-2 z-50 animate-in fade-in slide-in-from-top-1 duration-150">
-                                    <div className="px-4 py-2 border-b border-slate-100">
-                                        <p className="text-sm font-medium text-slate-900 truncate">{email}</p>
-                                        <p className="text-xs text-slate-500 mt-0.5">{isPro ? "Sagt Pro" : "Free"}</p>
+                                <div className="absolute right-0 top-full mt-2 w-56 bg-white rounded-xl shadow-lg border border-line py-2 z-50 animate-in fade-in slide-in-from-top-1 duration-150">
+                                    <div className="px-4 py-2 border-b border-line">
+                                        <p className="text-sm font-medium text-ink truncate">{email}</p>
+                                        <p className="text-xs text-ink-muted mt-0.5">{isPro ? "Sagt Pro" : "Free"}</p>
                                     </div>
                                     <button
                                         onClick={() => { setShowUserMenu(false); clearSession(); }}
@@ -685,18 +846,18 @@ export function SplitView() {
                     )}
                 </div>
 
-                <div className="flex-1 flex flex-col gap-4 p-8 pt-4 overflow-y-auto min-h-0 [&::-webkit-scrollbar]:w-1.5 [&::-webkit-scrollbar-track]:bg-transparent [&::-webkit-scrollbar-thumb]:bg-slate-200 [&::-webkit-scrollbar-thumb]:rounded-full">
+                <div className="flex-1 flex flex-col gap-4 p-8 pt-4 overflow-y-auto min-h-0 [&::-webkit-scrollbar]:w-1.5 [&::-webkit-scrollbar-track]:bg-transparent [&::-webkit-scrollbar-thumb]:bg-line [&::-webkit-scrollbar-thumb]:rounded-full">
                         {/* Summary Section */}
                         {(analysisData || uploadedJobId || (isSignedIn && isPro)) && (
-                            <Card className="border border-indigo-100 shadow-sm bg-white/80 p-6 space-y-4 relative overflow-hidden flex-none">
+                            <Card className="border border-brand/10 shadow-sm bg-white/80 p-6 space-y-4 relative overflow-hidden flex-none">
                             <div className="flex items-center justify-between">
                                 <div className="flex items-center gap-2">
-                                    <h3 className="font-semibold text-xs text-indigo-900 uppercase tracking-widest opacity-70">Sammanfattning</h3>
+                                    <h3 className="font-semibold text-xs text-ink uppercase tracking-widest opacity-70">Sammanfattning</h3>
                                     {analysisData?.summary && (
                                         <Button
                                             variant="ghost"
                                             size="icon"
-                                            className="h-5 w-5 text-indigo-400 hover:text-indigo-600 hover:bg-indigo-50 rounded-full"
+                                            className="h-5 w-5 text-brand/60 hover:text-brand hover:bg-brand/5 rounded-full"
                                             onClick={(e) => handleCopy(analysisData.summary, "summary", e)}
                                             title="Kopiera sammanfattning"
                                         >
@@ -709,7 +870,7 @@ export function SplitView() {
                                     <Button
                                       variant="ghost"
                                       size="icon"
-                                      className="h-6 w-6 text-slate-400 hover:text-indigo-600 hover:bg-indigo-50 rounded-full"
+                                      className="h-6 w-6 text-ink-muted hover:text-brand hover:bg-brand/5 rounded-full"
                                       title={analysisData ? "Analysera igen" : "Starta analys"}
                                       onClick={handleAction}
                                     >
@@ -721,14 +882,14 @@ export function SplitView() {
                             {isReanalyzing ? (
                                 <div className="flex flex-col items-center justify-center h-[50vh] space-y-4 p-8 text-center animate-in fade-in zoom-in-95 duration-500">
                                     <div className="relative">
-                                        <div className="absolute inset-0 bg-indigo-200 rounded-full animate-ping opacity-25"></div>
-                                        <div className="relative w-12 h-12 bg-indigo-100 rounded-full flex items-center justify-center text-indigo-600">
+                                        <div className="absolute inset-0 bg-brand/20 rounded-full animate-ping opacity-25"></div>
+                                        <div className="relative w-12 h-12 bg-brand/10 rounded-full flex items-center justify-center text-brand">
                                             <Loader2 className="w-6 h-6 animate-spin" />
                                         </div>
                                     </div>
                                     <div className="text-center space-y-1">
-                                        <h3 className="text-sm font-medium text-slate-900">Uppdaterar analys...</h3>
-                                        <p className="text-xs text-slate-500 animate-pulse">
+                                        <h3 className="text-sm font-medium text-ink">Uppdaterar analys...</h3>
+                                        <p className="text-xs text-ink-muted animate-pulse">
                                             Analyserar kontext, beslut och åtgärder...
                                         </p>
                                     </div>
@@ -736,7 +897,7 @@ export function SplitView() {
                             ) : analysisData ? (
                                 <div className="space-y-4 animate-in fade-in slide-in-from-bottom-2 duration-500">
                                     <div className="prose prose-sm prose-slate max-w-none">
-                                        <p className="text-sm text-slate-700 leading-relaxed bg-white p-3 rounded-lg border border-slate-100 shadow-sm">
+                                        <p className="text-sm text-ink-soft leading-relaxed bg-white p-3 rounded-lg border border-line shadow-sm">
                                             {analysisData.summary || "Ingen sammanfattning tillgänglig."}
                                         </p>
                                     </div>
@@ -744,15 +905,15 @@ export function SplitView() {
                                     {/* Decisions Block */}
                                     <div className="space-y-2 mt-4">
                                         <div className="flex items-center gap-2">
-                                            <h4 className="text-xs font-semibold text-slate-900 uppercase tracking-wide flex items-center gap-1.5">
-                                                <div className="w-1.5 h-1.5 rounded-full bg-emerald-500"></div>
+                                            <h4 className="text-xs font-semibold text-ink uppercase tracking-wide flex items-center gap-1.5">
+                                                <div className="w-1.5 h-1.5 rounded-full bg-verified"></div>
                                                 Beslut
                                             </h4>
                                             {analysisData.decisions && analysisData.decisions.length > 0 && (
                                                 <Button
                                                     variant="ghost"
                                                     size="icon"
-                                                    className="h-5 w-5 text-slate-400 hover:text-slate-600 hover:bg-slate-100 rounded-full"
+                                                    className="h-5 w-5 text-ink-muted hover:text-ink-soft hover:bg-paper-dim rounded-full"
                                                     onClick={(e) => handleCopy(analysisData.decisions!.join("\n"), "decisions", e)}
                                                     title="Kopiera beslut"
                                                 >
@@ -763,29 +924,29 @@ export function SplitView() {
                                         {analysisData.decisions && analysisData.decisions.length > 0 ? (
                                             <ul className="space-y-2">
                                                 {analysisData.decisions.map((decision: string, i: number) => (
-                                                    <li key={i} className="text-xs text-slate-600 bg-emerald-50/50 p-2 rounded border border-emerald-100/50 flex gap-2 items-start">
-                                                        <span className="text-emerald-500 font-bold">•</span>
+                                                    <li key={i} className="text-xs text-ink-soft bg-verified/[0.04] p-2 rounded border border-verified/10 flex gap-2 items-start">
+                                                        <span className="text-verified font-bold">•</span>
                                                         {decision}
                                                     </li>
                                                 ))}
                                             </ul>
                                         ) : (
-                                            <p className="text-xs text-slate-400 italic">Inga beslut identifierade.</p>
+                                            <p className="text-xs text-ink-muted italic">Inga beslut identifierade.</p>
                                         )}
                                     </div>
 
                                     {/* Actions Block */}
                                     <div className="space-y-2 mt-4">
                                         <div className="flex items-center gap-2">
-                                            <h4 className="text-xs font-semibold text-slate-900 uppercase tracking-wide flex items-center gap-1.5">
-                                                <div className="w-1.5 h-1.5 rounded-full bg-indigo-500"></div>
+                                            <h4 className="text-xs font-semibold text-ink uppercase tracking-wide flex items-center gap-1.5">
+                                                <div className="w-1.5 h-1.5 rounded-full bg-brand"></div>
                                                 Åtgärder
                                             </h4>
                                             {analysisData.actions && analysisData.actions.length > 0 && (
                                                 <Button
                                                     variant="ghost"
                                                     size="icon"
-                                                    className="h-5 w-5 text-slate-400 hover:text-slate-600 hover:bg-slate-100 rounded-full"
+                                                    className="h-5 w-5 text-ink-muted hover:text-ink-soft hover:bg-paper-dim rounded-full"
                                                     onClick={(e) => handleCopy(analysisData.actions!.join("\n"), "actions", e)}
                                                     title="Kopiera åtgärder"
                                                 >
@@ -796,28 +957,28 @@ export function SplitView() {
                                         {analysisData.actions && analysisData.actions.length > 0 ? (
                                             <ul className="space-y-2">
                                                 {analysisData.actions.map((action: string, i: number) => (
-                                                    <li key={i} className="text-xs text-slate-600 bg-indigo-50/50 p-2 rounded border border-indigo-100/50 flex gap-2 items-start">
-                                                        <div className="w-3 h-3 rounded border border-indigo-200 mt-0.5 flex-shrink-0"></div>
+                                                    <li key={i} className="text-xs text-ink-soft bg-brand/[0.03] p-2 rounded border border-brand/10 flex gap-2 items-start">
+                                                        <div className="w-3 h-3 rounded border border-brand/20 mt-0.5 flex-shrink-0"></div>
                                                         {action}
                                                     </li>
                                                 ))}
                                             </ul>
                                         ) : (
-                                            <p className="text-xs text-slate-400 italic">Inga åtgärder identifierade.</p>
+                                            <p className="text-xs text-ink-muted italic">Inga åtgärder identifierade.</p>
                                         )}
                                     </div>
                                 </div>
                             ) : uploadedJobId ? (
                                 <div className="flex flex-col items-center justify-center p-8 space-y-4 animate-in fade-in zoom-in-95 duration-500">
                                     <div className="relative">
-                                        <div className="absolute inset-0 bg-indigo-200 rounded-full animate-ping opacity-25"></div>
-                                        <div className="relative w-12 h-12 bg-indigo-100 rounded-full flex items-center justify-center text-indigo-600">
+                                        <div className="absolute inset-0 bg-brand/20 rounded-full animate-ping opacity-25"></div>
+                                        <div className="relative w-12 h-12 bg-brand/10 rounded-full flex items-center justify-center text-brand">
                                             <Sparkles className="w-6 h-6 animate-pulse" />
                                         </div>
                                     </div>
                                     <div className="text-center space-y-1">
-                                        <h3 className="text-sm font-medium text-slate-900">{getStatusText()}</h3>
-                                        <p className="text-xs text-slate-500">
+                                        <h3 className="text-sm font-medium text-ink">{getStatusText()}</h3>
+                                        <p className="text-xs text-ink-muted">
                                             Analyserar kontext, beslut och åtgärder.
                                         </p>
                                     </div>
@@ -825,154 +986,104 @@ export function SplitView() {
                             ) : (
                                 <>
                                     <div className="space-y-3 opacity-50">
-                                        <div className="h-2 bg-slate-100 rounded w-3/4"></div>
-                                        <div className="h-2 bg-slate-100 rounded w-full"></div>
-                                        <div className="h-2 bg-slate-100 rounded w-5/6"></div>
+                                        <div className="h-2 bg-paper-dim rounded w-3/4"></div>
+                                        <div className="h-2 bg-paper-dim rounded w-full"></div>
+                                        <div className="h-2 bg-paper-dim rounded w-5/6"></div>
                                     </div>
-                                    <p className="text-xs text-slate-400 italic pt-2 text-center">
-                                        {isRecording ? "Transkriberar ljudutskrift i realtid..." : "Starta inspelning för att se live-transkribering."}
+                                    {/* #15: samma stil + copy-logik som vänstra panelens statustext (ej kursiv). */}
+                                    <p className="text-sm text-ink-muted pt-2 text-center">
+                                        {isRecording
+                                            ? (cloudStreamingActive ? "Transkriberar i molnet..." : "Transkriberar lokalt...")
+                                            : "Starta inspelningen för att se transkribering i realtid."}
                                     </p>
                                 </>
                             )}
                         </Card>
                         )}
 
-                        {/* Rendering Auth vs Action Block Hierarchy */}
-                        {(!isSignedIn) ? (
-                            <div className="border border-indigo-100 rounded-xl overflow-hidden animate-in fade-in zoom-in-95 duration-500">
-                                {/* Gradient header */}
-                                <div className="h-20 bg-gradient-to-br from-indigo-500 to-purple-600 relative flex items-center justify-center overflow-hidden">
-                                    <div className="absolute top-0 right-0 -translate-y-1/2 translate-x-1/3 w-32 h-32 bg-white/10 rounded-full blur-2xl" />
-                                    <div className="relative z-10 flex flex-col items-center text-white gap-1">
-                                        <div className="w-9 h-9 bg-white/20 backdrop-blur border border-white/30 rounded-full flex items-center justify-center shadow-lg">
-                                            <CloudLightning className="w-5 h-5 text-white" />
-                                        </div>
-                                        <span className="text-sm font-bold tracking-tight">Sagt.ai Pro</span>
+                        {/* Skeleton — syns genom blur-overlay för ej Pro-användare */}
+                        {(!isSignedIn || !isPro) && (
+                            <div className="space-y-5 pointer-events-none select-none" aria-hidden="true">
+
+                                {/* Sammanfattning */}
+                                <div className="space-y-2">
+                                    <p className="text-[10px] font-semibold text-ink-muted uppercase tracking-widest">Sammanfattning</p>
+                                    <div className="space-y-1.5">
+                                        <div className="h-2 bg-paper-dim rounded-full w-full" />
+                                        <div className="h-2 bg-paper-dim rounded-full w-5/6" />
+                                        <div className="h-2 bg-paper-dim rounded-full w-4/6" />
                                     </div>
-                                </div>
-                                <div className="p-5 bg-white space-y-4">
-                                    <ul className="space-y-2.5">
-                                        {[
-                                            "KB-Whisper Large — överlägsen precision på svenska",
-                                            "AI-sammanfattning, beslut och åtgärdspunkter",
-                                            "Molnsynk av dina inspelningar",
-                                            "100% Data Sovereignty inom EU"
-                                        ].map((item, i) => (
-                                            <li key={i} className="flex items-start gap-2.5 text-xs text-slate-700">
-                                                <div className="mt-0.5 w-3.5 h-3.5 rounded-full bg-emerald-100 text-emerald-600 flex items-center justify-center flex-shrink-0">
-                                                    <Check className="w-2 h-2" />
-                                                </div>
-                                                {item}
-                                            </li>
-                                        ))}
-                                    </ul>
-                                    <div className="flex flex-col gap-2 pt-1">
-                                        <Button onClick={() => setShowLoginModal(true)} className="w-full bg-indigo-600 hover:bg-indigo-700 shadow-sm" size="sm">
-                                            Logga in
-                                        </Button>
-                                        <p className="text-[10px] text-slate-400 text-center">Redan kund? Logga in för att aktivera Pro-funktioner.</p>
-                                    </div>
-                                </div>
-                            </div>
-                        ) : (!isPro) ? (
-                            <div className="flex flex-col items-center justify-center p-6 space-y-4 border border-indigo-200 rounded-xl bg-indigo-50/80 text-center relative overflow-hidden animate-in fade-in zoom-in-95 duration-500">
-                                <div className="absolute -right-4 -top-4 w-24 h-24 bg-indigo-200 rounded-full blur-2xl opacity-50"></div>
-                                <div className="w-12 h-12 bg-white rounded-full flex items-center justify-center text-indigo-600 shadow-sm border border-indigo-100 relative z-10">
-                                    {isPaymentWaiting
-                                        ? <Loader2 className="w-6 h-6 animate-spin" />
-                                        : <Sparkles className="w-6 h-6" />
-                                    }
-                                </div>
-                                <div className="relative z-10">
-                                    <h3 className="text-sm font-bold text-indigo-950 mb-1">
-                                        {isPaymentWaiting ? "Väntar på betalningsbekräftelse" : "Lås upp Sagt Pro"}
-                                    </h3>
-                                    <p className="text-xs text-indigo-800/80 w-full max-w-xs mx-auto mb-3 leading-relaxed">
-                                        {isPaymentWaiting
-                                            ? "Betalning öppnad i webbläsaren. Uppdateras automatiskt..."
-                                            : "Få obegränsad molntranskribering och djupgående analyser (Sovereign Llama 3.3)."}
-                                    </p>
                                 </div>
 
-                                {isPaymentWaiting ? (
-                                    <div className="flex flex-col items-center gap-2 relative z-10 w-full">
-                                        <button
-                                            onClick={manualPaymentRefresh}
-                                            className="text-xs font-medium text-indigo-700 hover:text-indigo-900 underline underline-offset-2"
-                                        >
-                                            Jag har betalat — uppdatera nu
-                                        </button>
-                                        <button
-                                            onClick={stopPaymentPolling}
-                                            className="text-xs text-slate-400 hover:text-slate-600"
-                                        >
-                                            Avbryt
-                                        </button>
+                                {/* Beslut */}
+                                <div className="space-y-2">
+                                    <p className="text-[10px] font-semibold text-ink-muted uppercase tracking-widest">Beslut</p>
+                                    <div className="space-y-2">
+                                        <div className="flex items-start gap-2">
+                                            <div className="w-1.5 h-1.5 rounded-full bg-paper-dim mt-1.5 flex-shrink-0" />
+                                            <div className="h-2 bg-paper-dim rounded-full w-4/5" />
+                                        </div>
+                                        <div className="flex items-start gap-2">
+                                            <div className="w-1.5 h-1.5 rounded-full bg-paper-dim mt-1.5 flex-shrink-0" />
+                                            <div className="h-2 bg-paper-dim rounded-full w-3/5" />
+                                        </div>
                                     </div>
-                                ) : (
-                                    <div className="flex flex-col items-center gap-2 relative z-10 w-full">
-                                        <Button onClick={async () => {
-                                            if (stripePaymentLink && userId) {
-                                                events.upgradeClicked();
-                                                const { invoke } = await import('@tauri-apps/api/core');
-                                                invoke('plugin:shell|open', { path: `${stripePaymentLink}?client_reference_id=${userId}` });
-                                                startPaymentPolling();
-                                            } else {
-                                                toast.error("Betalningslänk ej tillgänglig. Försök starta om appen.");
-                                            }
-                                        }} className="w-full max-w-[200px] bg-indigo-600 hover:bg-indigo-700 shadow-sm transition-all duration-200" size="sm">
-                                            Uppgradera nu
-                                        </Button>
-                                        <button
-                                            onClick={manualPaymentRefresh}
-                                            className="text-xs text-indigo-500 hover:text-indigo-700"
-                                        >
-                                            Har du redan betalat? Uppdatera status →
-                                        </button>
+                                </div>
+
+                                {/* Åtgärder */}
+                                <div className="space-y-2">
+                                    <p className="text-[10px] font-semibold text-ink-muted uppercase tracking-widest">Åtgärder</p>
+                                    <div className="space-y-2">
+                                        <div className="flex items-start gap-2">
+                                            <div className="w-3 h-3 rounded border border-line mt-0.5 flex-shrink-0" />
+                                            <div className="h-2 bg-paper-dim rounded-full w-full" />
+                                        </div>
+                                        <div className="flex items-start gap-2">
+                                            <div className="w-3 h-3 rounded border border-line mt-0.5 flex-shrink-0" />
+                                            <div className="h-2 bg-paper-dim rounded-full w-5/6" />
+                                        </div>
+                                        <div className="flex items-start gap-2">
+                                            <div className="w-3 h-3 rounded border border-line mt-0.5 flex-shrink-0" />
+                                            <div className="h-2 bg-paper-dim rounded-full w-3/4" />
+                                        </div>
                                     </div>
-                                )}
+                                </div>
                             </div>
-                        ) : null}
+                        )}
                 </div>
+
+                {/* Lock overlay — täcker hela höger kolonn inklusive "Protokoll"-rubrik, exakt som hero-mockupen */}
+                {(!isSignedIn || !isPro) && (
+                    <div className="absolute inset-0 z-[51] bg-white/55 backdrop-blur-[2px] grid place-items-center pointer-events-none">
+                        <div className="pointer-events-auto">
+                            {isPaymentWaiting ? (
+                                <div className="flex flex-col items-center gap-2">
+                                    <div className="inline-flex items-center gap-2 rounded-full bg-ink text-paper text-xs font-semibold px-4 py-2 shadow-md">
+                                        <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                                        Väntar på betalning...
+                                    </div>
+                                    <button
+                                        onClick={stopPaymentPolling}
+                                        className="text-xs text-ink-muted hover:text-ink-soft transition-colors"
+                                    >
+                                        Avbryt
+                                    </button>
+                                </div>
+                            ) : (
+                                <button
+                                    onClick={() => setShowUpsellModal(true)}
+                                    className="inline-flex items-center gap-2 rounded-full bg-ink text-paper text-xs font-semibold px-4 py-2 hover:bg-ink/90 transition-colors shadow-md"
+                                >
+                                    <Lock className="w-3.5 h-3.5" />
+                                    Lås upp med Pro
+                                </button>
+                            )}
+                        </div>
+                    </div>
+                )}
             </div >
 
-            {/* Login Modal Overlay */}
-            {showLoginModal && (
-                <div className="fixed inset-0 z-[100] flex items-center justify-center bg-slate-900/40 backdrop-blur-sm animate-in fade-in duration-200">
-                    <div className="bg-white rounded-2xl p-8 w-[440px] shadow-2xl relative animate-in zoom-in-95 duration-300 text-center">
-                        <button
-                            onClick={() => setShowLoginModal(false)}
-                            className="absolute top-4 right-4 p-2 rounded-full hover:bg-slate-100 text-slate-500 hover:text-slate-900 transition-colors z-10"
-                        >
-                            ✕
-                        </button>
-                        <div className="w-14 h-14 bg-indigo-100 rounded-full flex items-center justify-center mx-auto mb-4">
-                            <CloudLightning className="w-7 h-7 text-indigo-600" />
-                        </div>
-                        <h2 className="text-lg font-bold text-slate-900 mb-2">Logga in på Sagt.ai</h2>
-                        <p className="text-sm text-slate-500 mb-6">
-                            {isAuthenticating
-                                ? "Väntar på att du loggar in i webbläsaren..."
-                                : "Inloggningen öppnas i din webbläsare. Logga in och kom tillbaka hit."}
-                        </p>
-                        {isAuthenticating ? (
-                            <div className="flex flex-col items-center gap-3">
-                                <Loader2 className="w-6 h-6 animate-spin text-indigo-500" />
-                                <p className="text-xs text-slate-400">Väntar på autentisering...</p>
-                            </div>
-                        ) : (
-                            <Button
-                                onClick={startAuth}
-                                className="w-full bg-indigo-600 hover:bg-indigo-700 text-white"
-                            >
-                                Öppna webbläsaren
-                            </Button>
-                        )}
-                    </div>
-                </div>
-            )}
-            
-            <UpsellModal 
+            <UpsellModal
                 isOpen={showUpsellModal} 
                 onClose={() => setShowUpsellModal(false)} 
             />

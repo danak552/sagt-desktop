@@ -4,6 +4,8 @@
 
 [Download for Windows →](https://downloads.sagt.ai/Sagt.ai-setup.exe) | [sagt.ai](https://sagt.ai)
 
+**Current version: v0.9.29** — meeting audio now follows Windows output-device changes (e.g. USB-C headset plug/unplug) with self-healing capture and a warning when no system audio is detected; storage management with disk usage + automatic audio cleanup (transcripts kept); clearer recordings view with per-dimension status columns.
+
 ![Sagt.ai Desktop — real-time Swedish transcription](assets/screenshot.png)
 
 ---

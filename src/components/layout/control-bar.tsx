@@ -6,13 +6,15 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen, emit } from "@tauri-apps/api/event";
 import { toast } from "sonner";
 // import { open } from "@tauri-apps/plugin-shell"; // Removed for In-App Analysis
-// import { useSettingsStore } from "@/store/settings-store";
+import { useSettingsStore } from "@/store/settings-store";
 // import { useRecordingStore } from "@/store/recording-store";
 import { useAuthStore } from "@/store/auth-store";
-import { uploadJob } from "@/lib/api";
+import { uploadJob, reanalyzeTranscript } from "@/lib/api";
+import { applyInlineCloudResult } from "@/lib/cloud-sync";
 import { useSyncStore } from "@/store/sync-store";
 import { useTranscriptionStore } from "@/store/transcription-store";
 import { usePostHogEvents } from "@/hooks/use-posthog-events";
+import { waitForCloudStreamIdle, resetCloudStream } from "@/hooks/use-cloud-stream";
 
 interface Recording {
     id: number | null;
@@ -22,9 +24,14 @@ interface Recording {
     created_at: string;
     sync_status: string;
     cloud_job_id: string | null;
+    audio_deleted: boolean;
 }
 
-export function ControlBar() {
+interface ControlBarProps {
+    onViewChange?: (view: 'dashboard' | 'settings' | 'recordings') => void;
+}
+
+export function ControlBar({ onViewChange }: ControlBarProps) {
     const amplitude = useAudioAmplitude();
     const [elapsedSeconds, setElapsedSeconds] = useState(0);
     // Robust timer start time
@@ -104,12 +111,61 @@ export function ControlBar() {
                 // Trigger auto-sync if effective mode says we should use cloud, and we are Pro
                 const currentEffectiveMode = useSyncStore.getState().effectiveMode;
                 const isCloudMode = currentEffectiveMode === 'cloud_analysis' || currentEffectiveMode === 'cloud';
-                
+
+                // PRO live-molnströmning: texten kom redan succesivt från molnet (Du/Mötet/MOLN).
+                // Ladda INTE upp hela filen igen — det skulle skriva över de strömmade segmenten
+                // med ett enda MOLN-stycke OCH kosta 2×. Kör bara analys om läget är cloud_analysis.
+                if (useSyncStore.getState().cloudStreamingActive) {
+                    setUploadStatus('idle');
+                    try {
+                        // #6: vänta tills moln-kön dränerats så de sista chunkarna hinner in,
+                        // persistera sedan de strömmade segmenten till DB → historik/återöppning
+                        // visar samma Du/Mötet-vy, och vyn blankas inte vid stopp.
+                        useTranscriptionStore.getState().setIsProcessing(true);
+                        // 60 s: analysen ska köras på KOMPLETT text — eftersläpande chunks vid
+                        // mötesslut tar ofta >8 s att dränera (use-cloud-stream re-persisterar
+                        // dessutom vid varje äkta dränering som skyddsnät).
+                        await waitForCloudStreamIdle(60000);
+                        const segs = useTranscriptionStore.getState().segments;
+                        if (recording.id && segs.length > 0) {
+                            await invoke("update_recording_segments", {
+                                recordingId: recording.id,
+                                segments: segs.map(s => ({
+                                    start_time: s.start_time,
+                                    end_time: s.end_time,
+                                    text: s.text,
+                                    speaker: s.speaker,
+                                })),
+                            });
+                        }
+                        // Analys på den strömmade texten om läget är cloud_analysis.
+                        if (currentEffectiveMode === 'cloud_analysis' && segs.length > 0) {
+                            const token = getToken();
+                            if (token) {
+                                const fullText = segs.map(s => s.text).join(" ");
+                                const raw = await reanalyzeTranscript(fullText, "general", token);
+                                setAnalysisData({
+                                    summary: raw.summary || "",
+                                    decisions: raw.key_decisions || [],
+                                    actions: raw.action_items || [],
+                                    template_used: raw.template_used || "general",
+                                });
+                                events.analysisCompleted();
+                            }
+                        }
+                    } catch (e: any) {
+                        console.error("Streaming post-stop persist/analysis failed:", e);
+                    } finally {
+                        useTranscriptionStore.getState().setIsProcessing(false);
+                    }
+                    return;
+                }
+
                 if (isCloudMode && isPro) {
                     try {
                         const token = getToken();
                         if (!token) {
-                            toast.error("Auto-synk misslyckades: Kunde inte hämta autentiseringstoken.");
+                            toast.error("Autosynk misslyckades: Kunde inte hämta autentiseringstoken.");
                             return;
                         }
 
@@ -127,37 +183,33 @@ export function ControlBar() {
                         const job = await uploadJob(recording.file_path, "general", token, shouldAnalyze);
                         setUploadStatus('success');
 
-                        // Mark DB as uploaded
-                        await invoke("update_recording_status", {
-                            id: recording.id,
-                            status: 'uploaded',
-                            cloudJobId: job.id,
-                        });
-                        await emit("recording-synced");
-
-                        const updatedJobState: any = {
-                            ...recording,
-                            sync_status: 'uploaded',
-                            cloud_job_id: job.id
-                        };
-                        setActiveJob(updatedJobState);
-
-                        // Start polling regardless of mode — cloud transcription replaces local even without analysis
-                        useSyncStore.getState().setUploadedJobId(job.id);
-                        useSyncStore.getState().setProcessingStatus("PROCESSING");
-
-                        if (shouldAnalyze) {
-                            toast.success("Inspelningen är uppladdad! Analyserar i molnet...");
+                        if (useSettingsStore.getState().cloudSync) {
+                            // Synk PÅ → persisterat moln-jobb: markera synkat + polla (visas i dashboard)
+                            await invoke("update_recording_status", {
+                                id: recording.id,
+                                status: 'uploaded',
+                                cloudJobId: job.id,
+                            });
+                            await emit("recording-synced");
+                            setActiveJob({ ...recording, sync_status: 'uploaded', cloud_job_id: job.id });
+                            useSyncStore.getState().setUploadedJobId(job.id);
+                            useSyncStore.getState().setProcessingStatus("PROCESSING");
+                            toast.success(shouldAnalyze
+                                ? "Inspelningen är uppladdad! Analyserar i molnet..."
+                                : "Inspelningen är uppladdad! Transkriberar med KB-Whisper Large...");
                         } else {
-                            toast.success("Inspelningen är uppladdad! Transkriberar med KB-Whisper Large...");
+                            // Synk AV (default, privacy-first) → resultatet kom inline, inget sparas i molnet
+                            const wc = await applyInlineCloudResult(job, recording.id);
+                            events.cloudSyncCompleted(wc);
+                            toast.success("Transkriberad med KB-Whisper Large (resultat endast lokalt).");
                         }
 
                     } catch (error: any) {
                         console.error("Auto-sync failed:", error);
                         events.cloudSyncFailed(error?.message || 'unknown');
                         setUploadStatus('error');
-                        setErrorMessage(error.message || "Ett okänt fel inträffade vid auto-synk.");
-                        toast.error("Auto-synk misslyckades: " + (error?.message || error?.toString() || "Okänt fel"));
+                        setErrorMessage(error.message || "Ett okänt fel inträffade vid autosynk.");
+                        toast.error("Autosynk misslyckades: " + (error?.message || error?.toString() || "Okänt fel"));
                     }
                 } else if (isCloudMode && !isPro && isSignedIn) {
                     toast.warning("Molnläge kräver Pro. Inspelningen sparades lokalt.");
@@ -184,6 +236,22 @@ export function ControlBar() {
 
             } else {
                 // START RECORDING
+                // Avgör PRO live-molnströmning och informera Rust FÖRE inspelning startar.
+                // streaming=true → Rust skickar VAD-segment till molnet (ingen lokal small).
+                // Offline eller icke-Pro → false → lokal small-fallback (offline-first).
+                const cfg = useSettingsStore.getState();
+                const cloudMode = cfg.recordingMode === 'cloud' || cfg.recordingMode === 'cloud_analysis';
+                const streaming = isPro && navigator.onLine && cloudMode;
+                const merge = cfg.cloudDiarizationMode === 'merged';
+                // Ny session: nollställ moln-köns avbrotts-/felstatus från föregående session.
+                resetCloudStream();
+                try {
+                    await invoke("set_cloud_mode", { cloudStreaming: streaming, mergeChannels: merge });
+                } catch (e) {
+                    console.error("set_cloud_mode failed:", e);
+                }
+                useSyncStore.getState().setCloudStreamingActive(streaming);
+
                 await invoke("start_recording");
                 events.recordingStarted();
 
@@ -214,7 +282,7 @@ export function ControlBar() {
     return (
         <div className="h-24 border-t bg-white flex items-center justify-between px-8 relative z-30 shadow-[0_-4px_6px_-1px_rgba(0,0,0,0.05)]">
             <div className="text-sm font-medium text-muted-foreground flex flex-col min-w-[120px]">
-                <span className={`font-semibold transition-colors ${isRecording ? "text-red-500 animate-pulse" : "text-primary"}`}>
+                <span className={`font-semibold transition-colors ${isRecording ? "text-red-500 animate-pulse" : "text-ink-muted"}`}>
                     {isRecording ? "Spelar in..." : "Redo"}
                 </span>
                 <span className="text-xs text-muted-foreground/60 font-mono">{formatTime(elapsedSeconds)}</span>
@@ -222,42 +290,44 @@ export function ControlBar() {
 
             {/* AI Control removed and migrated to SplitView */}
             <div className="absolute top-1/2 -translate-y-1/2 -translate-x-1/2" style={{ left: 'calc(50vw - 16rem)' }}>
-                <Button
-                    size="icon"
-                    onClick={toggleRecording}
-                    className={`h-16 w-16 rounded-full shadow-xl border-4 border-white transition-all hover:scale-105 active:scale-95 ring-4 ${isRecording
-                        ? "bg-red-600 hover:bg-red-700 ring-red-100"
-                        : "bg-indigo-600 hover:bg-indigo-700 ring-indigo-100"
-                        }`}
-                >
-                    <Mic className="h-6 w-6 text-white" />
-                </Button>
+                <div className="relative">
+                    <Button
+                        size="icon"
+                        onClick={toggleRecording}
+                        className={`relative h-16 w-16 rounded-full shadow-xl transition-all duration-300 hover:scale-105 active:scale-95 ${isRecording
+                            ? "bg-red-600 hover:bg-red-700 border-4 border-white ring-4 ring-red-100"
+                            : "bg-green-500/15 hover:bg-green-500/25 border-2 border-green-400/60"
+                            }`}
+                    >
+                        <Mic className={`h-6 w-6 transition-colors duration-300 ${isRecording ? "text-white" : "text-green-600"}`} />
+                    </Button>
+                </div>
             </div>
 
             <div className="flex items-center gap-4">
                 {/* Audio Visualizers */}
                 <div className="flex gap-2 items-end h-8">
                     <div className="flex flex-col items-center gap-1">
-                        <div className="w-1.5 h-6 bg-slate-100 rounded-full overflow-hidden relative">
+                        <div className="w-1.5 h-6 bg-paper-dim rounded-full overflow-hidden relative">
                             <div
-                                className={`absolute bottom-0 w-full ${isRecording ? 'bg-indigo-500' : 'bg-slate-300'} transition-all duration-75 ease-out rounded-full`}
+                                className={`absolute bottom-0 w-full ${isRecording ? 'bg-brand' : 'bg-line'} transition-all duration-75 ease-out rounded-full`}
                                 style={{ height: isRecording ? `${Math.min(amplitude.mic * 500, 100)}%` : '0%' }}
                             />
                         </div>
-                        <span className="text-[10px] text-slate-400 font-mono uppercase">Mic</span>
+                        <span className="text-[10px] text-ink-muted font-mono uppercase">Mic</span>
                     </div>
                     <div className="flex flex-col items-center gap-1">
-                        <div className="w-1.5 h-6 bg-slate-100 rounded-full overflow-hidden relative">
+                        <div className="w-1.5 h-6 bg-paper-dim rounded-full overflow-hidden relative">
                             <div
-                                className={`absolute bottom-0 w-full ${isRecording ? 'bg-emerald-500' : 'bg-slate-300'} transition-all duration-75 ease-out rounded-full`}
+                                className={`absolute bottom-0 w-full ${isRecording ? 'bg-verified' : 'bg-line'} transition-all duration-75 ease-out rounded-full`}
                                 style={{ height: isRecording ? `${Math.min(amplitude.system * 500, 100)}%` : '0%' }}
                             />
                         </div>
-                        <span className="text-[10px] text-slate-400 font-mono uppercase">Sys</span>
+                        <span className="text-[10px] text-ink-muted font-mono uppercase">Sys</span>
                     </div>
                 </div>
 
-                <div onClick={() => events.settingsOpened()} className="flex items-center gap-2 text-xs bg-slate-100 px-3 py-1.5 rounded-full border border-slate-200 text-slate-700 hover:bg-slate-200 cursor-pointer transition-colors">
+                <div onClick={() => { events.settingsOpened(); onViewChange?.('settings'); }} className="flex items-center gap-2 text-xs bg-paper-dim px-3 py-1.5 rounded-full border border-line text-ink-soft hover:bg-line cursor-pointer transition-colors">
                     <Settings2 className="w-3 h-3" />
                     Systemljud + Mic
                 </div>

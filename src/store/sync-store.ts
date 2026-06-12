@@ -37,6 +37,10 @@ interface SyncState {
     setTemplateId: (id: string) => void;
     isRecording: boolean;
     setIsRecording: (isRecording: boolean) => void;
+    // true när den pågående/senaste inspelningen kördes med PRO live-molnströmning.
+    // Styr post-stop: hoppa över hel-fil-uppladdning (segmenten kom redan från molnet).
+    cloudStreamingActive: boolean;
+    setCloudStreamingActive: (val: boolean) => void;
     reset: () => void;
     resetToLive: () => void;
     resetSync: () => void;
@@ -70,6 +74,8 @@ export const useSyncStore = create<SyncState>((set) => ({
     setTemplateId: (id) => set({ templateId: id }),
     isRecording: false,
     setIsRecording: (isRecording) => set({ isRecording }),
+    cloudStreamingActive: false,
+    setCloudStreamingActive: (val) => set({ cloudStreamingActive: val }),
     setActiveJob: (job, fromHistory = false) => set({ activeJob: job, activeJobFromHistory: fromHistory }),
     reset: () => set({
         uploadedJobId: null,

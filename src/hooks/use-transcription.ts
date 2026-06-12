@@ -25,8 +25,10 @@ export function useTranscription() {
 
             const newSegment: UISegment = {
                 text,
-                start_time: event.payload.start || (Date.now() / 1000), // Seconds
-                end_time: event.payload.end || (Date.now() / 1000), // Seconds
+                // ?? (inte ||) så ett legitimt 0 (talstart i första sekunden) inte byts mot
+                // väggklockan. Rust skickar nu sessionsrelativa sekunder, delat för Du/Mötet.
+                start_time: event.payload.start ?? (Date.now() / 1000),
+                end_time: event.payload.end ?? (Date.now() / 1000),
                 timestamp: Date.now(), // Milliseconds for UI key/display
                 speaker: source
             };

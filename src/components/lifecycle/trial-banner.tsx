@@ -40,22 +40,22 @@ export function TrialBanner() {
     }
 
     return (
-        <div className="flex items-center gap-3 px-4 py-2 bg-amber-50 border-b border-amber-200 text-amber-800 text-sm">
-            <Clock className="h-4 w-4 shrink-0 text-amber-500" />
+        <div className="flex items-center gap-3 px-4 py-2 bg-ochre-soft border-b border-ochre/20 text-ochre text-sm">
+            <Clock className="h-4 w-4 shrink-0 text-ochre" />
             <span className="flex-1">
                 Din provperiod slutar om {daysLeft} {daysLeft === 1 ? "dag" : "dagar"}.
             </span>
             <Button
                 size="sm"
                 variant="outline"
-                className="h-7 px-3 border-amber-300 text-amber-700 hover:bg-amber-100 text-xs shrink-0"
+                className="h-7 px-3 border-ochre/30 text-ochre hover:bg-ochre-soft text-xs shrink-0"
                 onClick={() => stripePaymentLink && window.open(stripePaymentLink, "_blank")}
             >
                 Uppgradera
             </Button>
             <button
                 onClick={() => setDismissed(true)}
-                className="shrink-0 p-1 rounded hover:bg-amber-100 transition-colors"
+                className="shrink-0 p-1 rounded hover:bg-ochre/10 transition-colors"
                 aria-label="Stäng"
             >
                 <X className="h-3.5 w-3.5" />

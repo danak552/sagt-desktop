@@ -43,7 +43,7 @@ export function ModePill({ onUpsellClick }: ModePillProps) {
         if (isProcessing) {
             return {
                 label: "Bearbetar...",
-                colorClass: "bg-indigo-500/10 text-indigo-500 border-indigo-200/50",
+                colorClass: "bg-brand/10 text-brand border-brand/20",
                 icon: <Loader2 className="w-3.5 h-3.5 animate-spin" />
             };
         }
@@ -93,41 +93,41 @@ export function ModePill({ onUpsellClick }: ModePillProps) {
                     <ChevronDown className="w-3 h-3 ml-1 opacity-70" />
                 </div>
             </DropdownMenuTrigger>
-            <DropdownMenuContent align="end" className="w-64 rounded-xl border border-slate-100 shadow-xl p-2 bg-white/95 backdrop-blur-sm">
+            <DropdownMenuContent align="end" className="w-64 rounded-xl border border-line shadow-xl p-2 bg-white/95 backdrop-blur-sm">
                 <div className="px-2 py-1.5 mb-1">
-                    <p className="text-xs font-semibold text-slate-800">Inspelningsläge</p>
-                    <p className="text-[10px] text-slate-500 leading-tight mt-0.5">Välj var din ljudfil ska hanteras. Molnbearbetning ger överlägsen kvalitet.</p>
+                    <p className="text-xs font-semibold text-ink">Inspelningsläge</p>
+                    <p className="text-[10px] text-ink-muted leading-tight mt-0.5">Välj var din ljudfil ska hanteras. Molnbearbetning ger överlägsen kvalitet.</p>
                 </div>
 
                 <DropdownMenuItem
                     onClick={() => handleSelectMode('cloud')}
-                    className={`flex flex-col items-start p-2.5 rounded-lg cursor-pointer transition-colors ${(recordingMode === 'cloud' || recordingMode === 'cloud_analysis') ? 'bg-indigo-50/80' : 'hover:bg-slate-50'}`}
+                    className={`flex flex-col items-start p-2.5 rounded-lg cursor-pointer transition-colors ${(recordingMode === 'cloud' || recordingMode === 'cloud_analysis') ? 'bg-brand/5' : 'hover:bg-paper-dim'}`}
                 >
                     <div className="flex items-center w-full justify-between">
                         <div className="flex items-center gap-2">
-                            <Cloud className={`w-4 h-4 ${(recordingMode === 'cloud' || recordingMode === 'cloud_analysis') ? 'text-indigo-600' : 'text-slate-600'}`} />
-                            <span className={`text-sm font-medium ${(recordingMode === 'cloud' || recordingMode === 'cloud_analysis') ? 'text-indigo-900' : 'text-slate-700'}`}>
+                            <Cloud className={`w-4 h-4 ${(recordingMode === 'cloud' || recordingMode === 'cloud_analysis') ? 'text-brand' : 'text-ink-soft'}`} />
+                            <span className={`text-sm font-medium ${(recordingMode === 'cloud' || recordingMode === 'cloud_analysis') ? 'text-brand' : 'text-ink-soft'}`}>
                                 Moln (Large)
                             </span>
                         </div>
-                        {!isPro && <Lock className="w-3 h-3 text-slate-400" />}
+                        {!isPro && <Lock className="w-3 h-3 text-ink-muted" />}
                     </div>
-                    <p className="text-[10px] text-slate-500 mt-1 ml-6">Perfekt transkription via Berget.ai. Analysera manuellt med ⟳-knappen.</p>
+                    <p className="text-[10px] text-ink-muted mt-1 ml-6">Perfekt transkription via Berget.ai. Analysera manuellt med ⟳-knappen.</p>
                 </DropdownMenuItem>
 
                 <DropdownMenuItem
                     onClick={() => handleSelectMode('local')}
-                    className={`flex flex-col items-start p-2.5 rounded-lg cursor-pointer transition-colors ${recordingMode === 'local' ? 'bg-slate-100' : 'hover:bg-slate-50'}`}
+                    className={`flex flex-col items-start p-2.5 rounded-lg cursor-pointer transition-colors ${recordingMode === 'local' ? 'bg-paper-dim' : 'hover:bg-paper-dim'}`}
                 >
                     <div className="flex items-center w-full justify-between">
                         <div className="flex items-center gap-2">
-                            <HardDrive className={`w-4 h-4 ${recordingMode === 'local' ? 'text-slate-700' : 'text-slate-500'}`} />
-                            <span className={`text-sm font-medium ${recordingMode === 'local' ? 'text-slate-900' : 'text-slate-700'}`}>
+                            <HardDrive className={`w-4 h-4 ${recordingMode === 'local' ? 'text-ink-soft' : 'text-ink-muted'}`} />
+                            <span className={`text-sm font-medium ${recordingMode === 'local' ? 'text-ink' : 'text-ink-soft'}`}>
                                 Lokal (Small)
                             </span>
                         </div>
                     </div>
-                    <p className="text-[10px] text-slate-500 mt-1 ml-6">Ljudet lämnar aldrig din dator. Bra för extremt känsliga möten.</p>
+                    <p className="text-[10px] text-ink-muted mt-1 ml-6">Ljudet lämnar aldrig din dator. Bra för extremt känsliga möten.</p>
                 </DropdownMenuItem>
             </DropdownMenuContent>
         </DropdownMenu>

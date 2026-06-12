@@ -18,8 +18,60 @@ export interface Job {
     error_message?: string;
 }
 
-export async function uploadJob(filePath: string, templateId: string = "general", token: string, performAnalysis: boolean = true): Promise<Job> {
-    const { backendUrl, retentionPolicy, transcriptionLanguage } = useSettingsStore.getState();
+export interface ChunkResult {
+    text: string;
+    speaker: string;
+    start: number | null;
+}
+
+/**
+ * Live-strömning: POSTar EN kort tal-chunk (WAV-bytes från Rust `cloud-chunk-ready`)
+ * till /transcribe-chunk och returnerar molntexten. Synkront, låg-latens. Kastar vid
+ * 401/402/429 så anroparen kan hantera auth/kvot.
+ */
+export async function transcribeChunk(
+    audioBytes: ArrayLike<number>,
+    speaker: string,
+    start: number | null,
+    token: string,
+    monthlyMinutesLimit?: number,
+): Promise<ChunkResult> {
+    const { backendUrl, transcriptionLanguage } = useSettingsStore.getState();
+    let baseUrl = backendUrl.replace(/\/$/, "");
+    if (!baseUrl.endsWith("/api/v1")) baseUrl = `${baseUrl}/api/v1`;
+    const url = `${baseUrl}/transcribe-chunk`;
+
+    const uint8 = audioBytes instanceof Uint8Array ? audioBytes : new Uint8Array(audioBytes as number[]);
+    const file = new File([new Blob([uint8], { type: "audio/wav" })], "chunk.wav", { type: "audio/wav" });
+
+    const formData = new FormData();
+    formData.append("file", file);
+    formData.append("language", transcriptionLanguage ?? "sv");
+    formData.append("speaker", speaker);
+    if (start != null) formData.append("start", String(start));
+    if (monthlyMinutesLimit != null) formData.append("monthly_minutes_limit", String(monthlyMinutesLimit));
+
+    const response = await fetch(url, {
+        method: "POST",
+        headers: { "Authorization": `Bearer ${token}` },
+        body: formData,
+    });
+
+    if (!response.ok) {
+        const errText = await response.text();
+        let detail = errText;
+        try { const p = JSON.parse(errText); if (p.detail) detail = p.detail; } catch { }
+        if (response.status === 401) throw new Error(`Unauthorized: ${detail}`);
+        if (response.status === 402) throw new Error(`Payment Required: ${detail}`);
+        if (response.status === 429) throw new Error(`Quota: ${detail}`);
+        throw new Error(`Chunk-transkribering misslyckades: ${detail}`);
+    }
+
+    return await response.json();
+}
+
+export async function uploadJob(filePath: string, templateId: string = "general", token: string, performAnalysis: boolean = true, persistOverride?: boolean): Promise<Job> {
+    const { backendUrl, retentionPolicy, transcriptionLanguage, cloudSync } = useSettingsStore.getState();
 
     // TODO: Replace localhost with https://api.sagt.ai for production builds. (We will inject this variable during the actual build command).
 
@@ -45,6 +97,9 @@ export async function uploadJob(filePath: string, templateId: string = "general"
     formData.append("template_id", templateId);
     formData.append("perform_analysis", String(performAnalysis));
     formData.append("language", transcriptionLanguage ?? "sv");
+    // Opt-in molnsynk: persist=true → resultatet sparas i molnet (dashboard). Default av →
+    // backend returnerar resultatet inline och raderar jobbet (inget moln-spår).
+    formData.append("persist", String(persistOverride ?? cloudSync));
 
     // 4. Upload
     // Ensure backendUrl doesn't have trailing slash if we add one, or handle it
@@ -155,6 +210,40 @@ export async function getJob(jobId: string, token: string): Promise<Job> {
         console.error("Failed to fetch job:", error);
         throw error;
     }
+}
+
+/**
+ * Kör om analysen på ett SYNKAT moln-jobb. Backend uppdaterar job.analysis i Firestore
+ * → dashboard speglar senaste versionen. Använd endast för persisterade jobb (cloud_job_id).
+ * Osynkade/lokala jobb använder reanalyzeTranscript (stateless).
+ */
+export async function reanalyzeJob(jobId: string, templateId: string = "general", token: string): Promise<Job> {
+    const { backendUrl } = useSettingsStore.getState();
+    let baseUrl = backendUrl.replace(/\/$/, "");
+    if (!baseUrl.endsWith("/api/v1")) {
+        baseUrl = `${baseUrl}/api/v1`;
+    }
+    const url = `${baseUrl}/jobs/${jobId}/reanalyze`;
+
+    const formData = new FormData();
+    formData.append("template_id", templateId);
+
+    const response = await fetch(url, {
+        method: "POST",
+        headers: { "Authorization": `Bearer ${token}` },
+        body: formData,
+    });
+
+    if (!response.ok) {
+        const errorText = await response.text();
+        let parsedError = errorText;
+        try { const p = JSON.parse(errorText); if (p.detail) parsedError = p.detail; } catch (e) { }
+        if (response.status === 401) throw new Error(`Unauthorized: ${parsedError}`);
+        if (response.status === 402) throw new Error(`Payment Required: Denna funktion kräver Pro.`);
+        throw new Error(`Re-analys (moln) misslyckades: ${parsedError}`);
+    }
+
+    return await response.json();
 }
 
 export async function reanalyzeTranscript(text: string, templateId: string = "general", token: string): Promise<any> {

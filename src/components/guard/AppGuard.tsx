@@ -64,8 +64,6 @@ export function AppGuard({ children }: { children: React.ReactNode }) {
 
             if (data.maintenance_mode) {
                 setMaintenanceMessage(data.message || "Sagt.ai genomgår tillfälligt underhåll.")
-                // Maintain CHECKING state to block UI, or create a MAINTENANCE state. 
-                // Since instructions don't specify a MAINTENANCE state, we'll force Update_Required UI to show the message.
                 setState('UPDATE_REQUIRED')
                 return
             }
@@ -81,13 +79,11 @@ export function AppGuard({ children }: { children: React.ReactNode }) {
 
         } catch (error) {
             console.error("AppGuard: Network check failed, applying Offline Tolerance...", error)
-            // OFFLINE TOLERANCE RULE 
+            // OFFLINE TOLERANCE RULE
             const hasLicense = localStorage.getItem("sagt_beta_license")
             if (hasLicense) {
-                // Allow offline usage
                 setState('READY')
             } else {
-                // Prevent first-time usage without establishing a license
                 setState('OFFLINE_BLOCKED')
             }
         }
@@ -121,7 +117,6 @@ export function AppGuard({ children }: { children: React.ReactNode }) {
             }
         } catch (error) {
             console.error("Registration failed:", error)
-            // It might fail if they drop offline during registration
             alert("Kunde inte ansluta till servern. Kontrollera din uppkoppling.")
         } finally {
             setIsRegistering(false)
@@ -130,10 +125,10 @@ export function AppGuard({ children }: { children: React.ReactNode }) {
 
     if (state === 'CHECKING') {
         return (
-            <div className="h-screen w-screen flex items-center justify-center bg-slate-950 text-slate-50">
+            <div className="h-full w-full flex items-center justify-center bg-brand text-paper">
                 <div className="flex flex-col items-center gap-4">
-                    <Loader2 className="h-8 w-8 animate-spin text-indigo-500" />
-                    <p className="text-slate-400 font-medium">Ansluter till Sagt.ai...</p>
+                    <Loader2 className="h-8 w-8 animate-spin text-white/80" />
+                    <p className="text-white/60 font-medium">Ansluter till Sagt.ai...</p>
                 </div>
             </div>
         )
@@ -141,17 +136,17 @@ export function AppGuard({ children }: { children: React.ReactNode }) {
 
     if (state === 'UPDATE_REQUIRED') {
         return (
-            <div className="h-screen w-screen flex items-center justify-center bg-slate-950 text-slate-50 p-6 selection:bg-indigo-500/30">
-                <div className="max-w-md w-full bg-slate-900 border border-slate-800 rounded-2xl p-8 text-center shadow-2xl">
+            <div className="h-full w-full flex items-center justify-center bg-brand text-paper p-6">
+                <div className="max-w-md w-full bg-brand-deep border border-white/10 rounded-2xl p-8 text-center shadow-2xl">
                     <div className="w-16 h-16 bg-red-500/10 rounded-2xl flex items-center justify-center mx-auto mb-6">
                         <ShieldAlert className="h-8 w-8 text-red-400" />
                     </div>
-                    <h1 className="text-2xl font-bold tracking-tight mb-3">Uppdatering krävs</h1>
-                    <p className="text-slate-400 mb-8 leading-relaxed">
+                    <h1 className="text-2xl font-display font-bold tracking-tight mb-3">Uppdatering krävs</h1>
+                    <p className="text-white/60 mb-8 leading-relaxed">
                         {maintenanceMessage || "En kritisk uppdatering finns tillgänglig. Vänligen ladda ner den senaste versionen av Sagt.ai för att fortsätta."}
                     </p>
                     <Button
-                        className="w-full bg-indigo-600 hover:bg-indigo-700 text-white"
+                        className="w-full bg-white text-brand hover:bg-paper font-medium"
                         onClick={() => window.open(downloadUrl, "_blank")}
                     >
                         Ladda ner senaste versionen
@@ -163,18 +158,17 @@ export function AppGuard({ children }: { children: React.ReactNode }) {
 
     if (state === 'OFFLINE_BLOCKED') {
         return (
-            <div className="h-screen w-screen flex items-center justify-center bg-slate-950 text-slate-50 p-6 selection:bg-indigo-500/30">
-                <div className="max-w-md w-full bg-slate-900 border border-slate-800 rounded-2xl p-8 text-center shadow-2xl">
+            <div className="h-full w-full flex items-center justify-center bg-brand text-paper p-6">
+                <div className="max-w-md w-full bg-brand-deep border border-white/10 rounded-2xl p-8 text-center shadow-2xl">
                     <div className="w-16 h-16 bg-amber-500/10 rounded-2xl flex items-center justify-center mx-auto mb-6">
                         <WifiOff className="h-8 w-8 text-amber-400" />
                     </div>
-                    <h1 className="text-2xl font-bold tracking-tight mb-3">Ingen anslutning</h1>
-                    <p className="text-slate-400 mb-8 leading-relaxed">
+                    <h1 className="text-2xl font-display font-bold tracking-tight mb-3">Ingen anslutning</h1>
+                    <p className="text-white/60 mb-8 leading-relaxed">
                         Ingen internetanslutning. Du måste vara uppkopplad första gången du startar Sagt.ai för att registrera dig på plattformen.
                     </p>
                     <Button
-                        variant="outline"
-                        className="w-full bg-slate-800 hover:bg-slate-700 border-0"
+                        className="w-full bg-white text-brand hover:bg-paper font-medium"
                         onClick={validateAccess}
                     >
                         Försök igen
@@ -186,42 +180,42 @@ export function AppGuard({ children }: { children: React.ReactNode }) {
 
     if (state === 'REGISTRATION_REQUIRED') {
         return (
-            <div className="h-screen w-screen flex items-center justify-center bg-slate-950 text-slate-50 p-4 sm:p-6 selection:bg-indigo-500/30">
+            <div className="h-full w-full flex items-center justify-center bg-brand text-paper p-4 sm:p-6">
                 <div className="max-w-md w-full relative">
-                    {/* Visual glowing backdrop */}
-                    <div className="absolute -inset-1 bg-gradient-to-r from-indigo-500 to-cyan-500 rounded-2xl blur opacity-20" />
+                    {/* Subtil glöd mot brand-bakgrunden */}
+                    <div className="absolute -inset-1 bg-brand/40 rounded-2xl blur opacity-20" />
 
-                    <div className="relative bg-slate-900 border border-slate-800 rounded-2xl p-6 sm:p-8 shadow-2xl">
-                        <div className="w-12 h-12 bg-indigo-500/10 rounded-xl flex items-center justify-center mb-6 border border-indigo-500/20">
-                            <SmartphoneNfc className="h-6 w-6 text-indigo-400" />
+                    <div className="relative bg-brand-deep border border-white/10 rounded-2xl p-6 sm:p-8 shadow-2xl">
+                        <div className="w-12 h-12 bg-white/10 rounded-xl flex items-center justify-center mb-6 border border-white/20">
+                            <SmartphoneNfc className="h-6 w-6 text-white/70" />
                         </div>
 
-                        <h1 className="text-2xl font-bold tracking-tight mb-2">Välkommen till Sagt.ai Beta</h1>
-                        <p className="text-slate-400 mb-8">
+                        <h1 className="text-2xl font-display font-bold tracking-tight mb-2">Välkommen till Sagt.ai Beta</h1>
+                        <p className="text-white/60 mb-8">
                             Ange din e-postadress för att aktivera programmet och få early-access uppdateringar.
                         </p>
 
                         <form onSubmit={handleRegister} className="space-y-4">
                             <div className="space-y-2">
-                                <label className="text-sm font-medium text-slate-300 ml-1">
+                                <label className="text-sm font-medium text-white/80 ml-1">
                                     E-postadress
                                 </label>
                                 <div className="relative">
-                                    <Mail className="absolute left-3 top-1/2 -translate-y-1/2 h-5 w-5 text-slate-500" />
+                                    <Mail className="absolute left-3 top-1/2 -translate-y-1/2 h-5 w-5 text-white/40" />
                                     <Input
                                         type="email"
                                         required
                                         placeholder="namn@företag.se"
                                         value={email}
                                         onChange={(e: React.ChangeEvent<HTMLInputElement>) => setEmail(e.target.value)}
-                                        className="pl-10 h-12 bg-slate-950 border-slate-800 placeholder:text-slate-600 focus-visible:ring-indigo-500"
+                                        className="pl-10 h-12 bg-brand/60 border-white/20 text-white placeholder:text-white/30 focus-visible:ring-brand"
                                         disabled={isRegistering}
                                     />
                                 </div>
                             </div>
                             <Button
                                 type="submit"
-                                className="w-full h-12 bg-indigo-600 hover:bg-indigo-700 text-white font-medium mt-4"
+                                className="w-full h-12 bg-white text-brand hover:bg-paper font-medium mt-4"
                                 disabled={isRegistering || !email}
                             >
                                 {isRegistering ? (

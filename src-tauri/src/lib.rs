@@ -2,18 +2,19 @@
 mod audio;
 mod database;
 
-use database::{DatabaseManager, Recording, Segment};
+use database::{CleanupResult, DatabaseManager, Recording, Segment, StorageUsage};
+use tauri::Emitter;
 use tauri::Manager;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::collections::HashSet;
 
 /// Holds the PID of the active whisper-cli child process.
 /// Stored as a PID (u32) rather than Child to avoid Send/ownership issues
 /// when stdout is taken and the thread is blocking on it.
 pub struct TranscriptionProcess {
-    pub pid: Mutex<Option<u32>>,
-    /// Set to true when the user deliberately cancels — suppresses false "kraschade" error
-    pub cancelled: AtomicBool,
+    /// PID:er för alla aktiva whisper-cli-processer. cancel_transcription dödar samtliga
+    /// (tidigare höll fältet bara EN PID → kön fortsatte efter Avbryt).
+    pub pids: Mutex<HashSet<u32>>,
 }
 
 // Removed AppState wrapper to allow easier access from audio.rs
@@ -40,7 +41,17 @@ fn get_audio_devices(
 #[tauri::command]
 fn start_recording(
     state: tauri::State<'_, audio::AudioMonitor>,
+    proc: tauri::State<'_, TranscriptionProcess>,
 ) -> Result<(), String> {
+    // Ny session: bumpa generationen och dränera föregående sessions transkriberingar
+    // (döda kvarvarande whisper-cli + invalidera köade) så gammal text inte läcker in
+    // i den nya inspelningen.
+    audio::bump_session_generation();
+    if let Ok(mut pids) = proc.pids.lock() {
+        for pid in pids.drain() {
+            kill_pid(pid);
+        }
+    }
     state.start_recording()
 }
 
@@ -74,29 +85,44 @@ fn update_audio_settings(
 }
 
 #[tauri::command]
+fn set_cloud_mode(
+    state: tauri::State<'_, audio::AudioMonitor>,
+    cloud_streaming: bool,
+    merge_channels: bool,
+) {
+    state.set_cloud_mode(cloud_streaming, merge_channels);
+}
+
+#[tauri::command]
 fn cancel_transcription(
     state: tauri::State<'_, TranscriptionProcess>,
 ) -> Result<(), String> {
-    if let Ok(mut pid_lock) = state.pid.lock() {
-        if let Some(pid) = pid_lock.take() {
-            // Mark as intentionally cancelled BEFORE killing
-            state.cancelled.store(true, Ordering::SeqCst);
-            println!("[KillSwitch] Killing whisper-cli process PID={}", pid);
-            #[cfg(target_os = "windows")]
-            {
-                let _ = std::process::Command::new("taskkill")
-                    .args(&["/F", "/PID", &pid.to_string()])
-                    .output();
-            }
-            #[cfg(not(target_os = "windows"))]
-            {
-                let _ = std::process::Command::new("kill")
-                    .args(&["-9", &pid.to_string()])
-                    .output();
-            }
+    // Bumpa generationen → köade OCH pågående uppgifter slänger sina resultat (se audio.rs).
+    audio::bump_session_generation();
+    // Döda ALLA aktiva whisper-cli-processer, inte bara den senast spawnade.
+    if let Ok(mut pids) = state.pids.lock() {
+        for pid in pids.drain() {
+            kill_pid(pid);
         }
     }
     Ok(())
+}
+
+/// Dödar en whisper-cli-process via OS:ets kill-kommando (best-effort).
+fn kill_pid(pid: u32) {
+    println!("[KillSwitch] Killing whisper-cli process PID={}", pid);
+    #[cfg(target_os = "windows")]
+    {
+        let _ = std::process::Command::new("taskkill")
+            .args(&["/F", "/PID", &pid.to_string()])
+            .output();
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = std::process::Command::new("kill")
+            .args(&["-9", &pid.to_string()])
+            .output();
+    }
 }
 
 #[tauri::command]
@@ -146,6 +172,16 @@ fn get_recording_segments(
 }
 
 #[tauri::command]
+fn update_recording_segments(
+    state: tauri::State<'_, Mutex<DatabaseManager>>,
+    recording_id: i64,
+    segments: Vec<Segment>,
+) -> Result<(), String> {
+    let db = state.lock().map_err(|e| e.to_string())?;
+    db.update_recording_segments(recording_id, segments)
+}
+
+#[tauri::command]
 fn update_recording_status(
     state: tauri::State<'_, Mutex<DatabaseManager>>,
     id: i64,
@@ -176,6 +212,46 @@ fn save_analysis_to_db(
     db.save_analysis(id, analysis, template)
 }
 
+#[tauri::command]
+fn save_cloud_transcript_to_db(
+    state: tauri::State<'_, Mutex<DatabaseManager>>,
+    id: i64,
+    transcript: String,
+) -> Result<(), String> {
+    let db = state.lock().map_err(|e| e.to_string())?;
+    db.save_cloud_transcript(id, transcript)
+}
+
+#[tauri::command]
+fn get_storage_usage(
+    state: tauri::State<'_, Mutex<DatabaseManager>>,
+) -> Result<StorageUsage, String> {
+    let db = state.lock().map_err(|e| e.to_string())?;
+    db.get_storage_usage()
+}
+
+/// Auto-gallring av ljudfiler (äldst först). DB-rader med transkript/analys behålls
+/// och markeras audio_deleted. Anropas från JS med camelCase: maxAgeDays, maxTotalBytes.
+#[tauri::command]
+fn cleanup_audio_storage(
+    state: tauri::State<'_, Mutex<DatabaseManager>>,
+    app: tauri::AppHandle,
+    max_age_days: Option<u32>,
+    max_total_bytes: Option<u64>,
+) -> Result<CleanupResult, String> {
+    let result = {
+        let db = state.lock().map_err(|e| e.to_string())?;
+        db.cleanup_audio(max_age_days, max_total_bytes)?
+    };
+    // Eget event (inte history-updated) — App.tsx kör gallring på history-updated,
+    // så att återanvända det eventet skulle ge en loop. deleted_ids kan innehålla
+    // reconcilierade rader (fil saknades) även när deleted_count är 0.
+    if !result.deleted_ids.is_empty() {
+        let _ = app.emit("storage-cleaned", &result);
+    }
+    Ok(result)
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -190,9 +266,8 @@ pub fn run() {
             }
 
             app.manage(audio::AudioMonitor::new());
-            app.manage(TranscriptionProcess { 
-                pid: Mutex::new(None),
-                cancelled: AtomicBool::new(false),
+            app.manage(TranscriptionProcess {
+                pids: Mutex::new(HashSet::new()),
             });
             
             // Initialize Database
@@ -215,16 +290,21 @@ pub fn run() {
             get_audio_devices,
             start_recording, 
             stop_recording, 
-            stop_audio_listener, 
-            update_audio_settings, 
+            stop_audio_listener,
+            update_audio_settings,
+            set_cloud_mode,
             read_audio_file,
             cancel_transcription,
             save_recording_to_db,
             get_recordings,
             get_recording_segments,
+            update_recording_segments,
             delete_recording_db,
             update_recording_status,
-            save_analysis_to_db
+            save_analysis_to_db,
+            save_cloud_transcript_to_db,
+            get_storage_usage,
+            cleanup_audio_storage
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

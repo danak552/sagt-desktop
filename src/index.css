@@ -2,17 +2,35 @@
 
 @theme {
     --font-sans: "Geist Sans", ui-sans-serif, system-ui;
-    --color-primary: #4f46e5;
-    /* Electric Indigo */
-    --color-sidebar: #f8fafc;
+    --font-display: "Source Serif 4", ui-serif, Georgia, serif;
+    --color-primary: oklch(30% 0.08 225);
+    /* = brand (harmoniserad — var Electric Indigo #4f46e5). Sveper alla shadcn
+       primary-användningar (knappar, slider, switch, settings-markeringar) till brand. */
+    --color-primary-foreground: oklch(97% 0.008 75);
+    /* paper/vit — säkrar kontrast för text på primary-knappar (bg-primary) */
+
+    /* ── Semantic brand tokens — matchar sagt.ai marketing-palett ─────────── */
+    --color-brand: oklch(30% 0.08 225);
+    --color-brand-deep: oklch(23% 0.08 225);
+    --color-paper: oklch(97% 0.008 75);
+    --color-paper-dim: oklch(93% 0.008 75);
+    --color-ink: oklch(14% 0.01 75);
+    --color-ink-soft: oklch(38% 0.01 75);
+    --color-ink-muted: oklch(55% 0.01 75);
+    --color-line: oklch(86% 0.012 75);
+    --color-ochre: oklch(57% 0.10 55);
+    --color-ochre-soft: oklch(92% 0.06 55);
+    --color-verified: oklch(50% 0.12 145);
+    --color-sidebar: oklch(93% 0.008 75);
+    /* paper-dim — var: kall #f8fafc */
 }
 
 @layer base {
     * {
-        @apply border-slate-200;
+        @apply border-line;
     }
 
     body {
-        @apply bg-white text-slate-900 font-sans antialiased;
+        @apply bg-paper text-ink font-sans antialiased;
     }
 }

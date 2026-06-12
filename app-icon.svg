@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+  <!-- Background: brand oklch(30% 0.08 225) = #00354c, rounded square -->
+  <rect width="1024" height="1024" rx="220" fill="#00354c"/>
+
+  <!-- Mic capsule: 200 × 360 px, centered at x=512 -->
+  <rect x="412" y="192" width="200" height="360" rx="100" fill="white"/>
+
+  <!-- Stand arc: semicircle from (280,488) down to (744,488)
+       rx=ry=232, sweep=0 (CCW) → lowest point at (512,720) -->
+  <path d="M 280 488 A 232 232 0 0 0 744 488"
+        fill="none" stroke="white" stroke-width="64" stroke-linecap="round"/>
+
+  <!-- Stem: (512,720) → (512,800) -->
+  <line x1="512" y1="720" x2="512" y2="800"
+        stroke="white" stroke-width="64" stroke-linecap="round"/>
+
+  <!-- Base: centered, symmetric -->
+  <line x1="368" y1="800" x2="656" y2="800"
+        stroke="white" stroke-width="64" stroke-linecap="round"/>
+</svg>

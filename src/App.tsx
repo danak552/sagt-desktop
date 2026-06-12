@@ -1,17 +1,21 @@
 import { useState, useEffect } from "react";
 import { Sidebar } from "./components/layout/sidebar";
 import { ControlBar } from "./components/layout/control-bar";
+import { TitleBar } from "./components/layout/title-bar";
 import { SplitView } from "./components/dashboard/split-view";
 import { AppGuard } from "./components/guard/AppGuard";
 import { SettingsPage } from "./pages/settings-page";
 import { RecordingsPage } from "./pages/recordings-page";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { useSettingsStore } from "./store/settings-store";
 import { useSyncStore } from "./store/sync-store";
-import { Toaster } from "sonner";
+import { Toaster, toast } from "sonner";
 import { useConnectivity } from "@/hooks/use-connectivity";
 import { usePaymentRefresh } from "@/hooks/use-payment-refresh";
 import { useUpdater } from "@/hooks/use-updater";
+import { useCloudStream } from "@/hooks/use-cloud-stream";
+import { runStorageCleanup, getStorageUsage, formatBytes, GB, type CleanupResult } from "@/lib/storage";
 import { useAuthStore } from "@/store/auth-store";
 import { MotdBanner } from "@/components/lifecycle/motd-banner";
 import { TrialBanner } from "@/components/lifecycle/trial-banner";
@@ -19,6 +23,7 @@ import { TrialBanner } from "@/components/lifecycle/trial-banner";
 function App() {
   useConnectivity();
   useUpdater();
+  useCloudStream();
 
   const [currentView, setCurrentView] = useState<'dashboard' | 'settings' | 'recordings'>('dashboard');
   const isSignedIn = useAuthStore((s) => s.isSignedIn);
@@ -42,6 +47,65 @@ function App() {
     invoke("init_audio_engine", { device: state.inputDevice }).catch(console.error);
   }, []);
 
+  // Auto-gallring av ljudfiler enligt vald policy: vid appstart och efter varje sparad
+  // inspelning (history-updated). Vid "Behåll allt" + stor diskanvändning visas i stället
+  // en nudge — inget raderas utan aktivt val (offline-first: ljudet är enda kopian).
+  useEffect(() => {
+    const NUDGE_THRESHOLD_BYTES = 10 * GB;
+
+    runStorageCleanup()
+      .then(async (result) => {
+        if (result !== null) return; // policy hanterade gallringen
+        const usage = await getStorageUsage();
+        if (usage.recordings_bytes > NUDGE_THRESHOLD_BYTES) {
+          toast.warning(
+            `Dina inspelningar tar ${formatBytes(usage.recordings_bytes)} på disken. ` +
+            `Välj en gallringspolicy under Inställningar → Lagring.`,
+            { duration: 12_000 }
+          );
+        }
+      })
+      .catch(console.error);
+
+    const unlistenPromise = listen("history-updated", () => {
+      runStorageCleanup().catch(console.error);
+    });
+    // Håll in-memory-state i synk: om gallringen träffar inspelningen som är öppen i
+    // SplitView måste activeJob.audio_deleted uppdateras, annars ser guards stale data
+    // och moln-uppladdning misslyckas med kryptiskt filfel.
+    const unlistenCleaned = listen<CleanupResult>("storage-cleaned", (event) => {
+      const { activeJob, setActiveJob, activeJobFromHistory } = useSyncStore.getState();
+      if (activeJob?.id && event.payload.deleted_ids.includes(activeJob.id)) {
+        setActiveJob({ ...activeJob, audio_deleted: true }, activeJobFromHistory);
+      }
+    });
+    return () => {
+      unlistenPromise.then((f) => f());
+      unlistenCleaned.then((f) => f());
+    };
+  }, []);
+
+  // Surface ljudmotor-fel (mik saknas, stream-bygge misslyckas) som toast istället för
+  // tyst död. Rust återställer is_running=false vid fel så att en omstart/enhetsbyte
+  // faktiskt försöker igen.
+  useEffect(() => {
+    const unlistenPromise = listen<string>("audio-error", (event) => {
+      console.error("Audio engine error:", event.payload);
+      toast.error("Ljudfel: " + event.payload, { duration: 8000 });
+    });
+    return () => { unlistenPromise.then((f) => f()); };
+  }, []);
+
+  // Guardrail från ljudmotorn: molninspelning pågår men inget systemljud fångas
+  // (t.ex. ljudutgång urdragen/inaktiverad). Engångsvarning per inspelning från Rust.
+  useEffect(() => {
+    const unlistenPromise = listen<string>("audio-warning", (event) => {
+      console.warn("Audio engine warning:", event.payload);
+      toast.warning(event.payload, { duration: 10000 });
+    });
+    return () => { unlistenPromise.then((f) => f()); };
+  }, []);
+
   // Hämta färsk Pro-status vid appstart och sedan var 60:e sekund.
   // Fångar upp avslutade eller nyaktiverade prenumerationer under aktiv session.
   useEffect(() => {
@@ -52,22 +116,27 @@ function App() {
   }, [isSignedIn]);
 
   return (
-    <AppGuard>
-      <div className="flex h-screen w-screen overflow-hidden bg-slate-50 text-foreground font-sans antialiased text-sm">
-        <Sidebar currentView={currentView} onViewChange={setCurrentView} />
-        <main className="flex-1 flex flex-col h-full overflow-hidden relative">
-          <MotdBanner />
-          <TrialBanner />
-          <div className="flex-1 overflow-hidden relative">
-            {currentView === 'dashboard' ? <SplitView /> :
-              currentView === 'settings' ? <SettingsPage /> :
-                <RecordingsPage onViewChange={setCurrentView} />}
+    <div className="flex flex-col h-screen w-screen overflow-hidden bg-paper-dim text-foreground font-sans antialiased text-sm">
+      <TitleBar />
+      <div className="flex-1 min-h-0 w-full relative">
+        <AppGuard>
+          <div className="flex h-full w-full overflow-hidden">
+            <Sidebar currentView={currentView} onViewChange={setCurrentView} />
+            <main className="flex-1 flex flex-col h-full overflow-hidden relative">
+              <MotdBanner />
+              <TrialBanner />
+              <div className="flex-1 overflow-hidden relative">
+                {currentView === 'dashboard' ? <SplitView /> :
+                  currentView === 'settings' ? <SettingsPage /> :
+                    <RecordingsPage onViewChange={setCurrentView} />}
+              </div>
+              <ControlBar onViewChange={setCurrentView} />
+            </main>
           </div>
-          <ControlBar />
-        </main>
+        </AppGuard>
       </div>
       <Toaster richColors position="bottom-right" />
-    </AppGuard>
+    </div>
   );
 }
 

@@ -1,11 +1,14 @@
 import { format } from "date-fns";
 import { sv } from "date-fns/locale";
-import { Cloud, CloudUpload, Trash2, FileAudio } from "lucide-react";
+import { Cloud, CloudUpload, Trash2, FileAudio, FileText } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { useSyncStore } from "@/store/sync-store";
+import { useAuthStore } from "@/store/auth-store";
+import { uploadJob } from "@/lib/api";
 import { useState, useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { toast } from "sonner";
 
 interface Recording {
     id: number;
@@ -16,12 +19,17 @@ interface Recording {
     sync_status: 'local' | 'synced' | 'uploaded';
     cloud_job_id?: string;
     analysis_json?: string;
+    audio_deleted: boolean;
+    has_segments: boolean;
 }
 
 export function RecordingsPage({ onViewChange }: { onViewChange: (view: 'dashboard' | 'settings' | 'recordings') => void }) {
     // Replace store with local state fetched from DB
     const [recordings, setRecordings] = useState<Recording[]>([]);
     const { setSession, setUploadedJobId, setActiveJob, setAnalysisData, setProcessingStatus } = useSyncStore();
+    const getToken = useAuthStore((s) => s.getToken);
+    const isPro = useAuthStore((s) => s.isPro());
+    const [syncingId, setSyncingId] = useState<number | null>(null);
 
     const loadRecordings = async () => {
         try {
@@ -42,10 +50,15 @@ export function RecordingsPage({ onViewChange }: { onViewChange: (view: 'dashboa
         const unlistenSynced = listen("recording-synced", () => {
             loadRecordings();
         });
+        // Auto-gallring kan radera ljudfiler medan listan visas — uppdatera badges.
+        const unlistenCleaned = listen("storage-cleaned", () => {
+            loadRecordings();
+        });
 
         return () => {
             unlistenHistory.then(f => f());
             unlistenSynced.then(f => f());
+            unlistenCleaned.then(f => f());
         };
     }, []);
 
@@ -88,6 +101,35 @@ export function RecordingsPage({ onViewChange }: { onViewChange: (view: 'dashboa
         }
     };
 
+    // Manuell historik-synk: tvinga moln-persistens (persistOverride=true) oavsett
+    // cloudSync-inställningen. För att lyfta gamla lokala inspelningar till dashboarden.
+    const handleSync = async (rec: Recording) => {
+        // Knappen döljs för gallrade rader, men raden kan vara stale om auto-gallring
+        // hann köra efter senaste listladdning — ge tydligt fel i stället för filfel.
+        if (rec.audio_deleted) {
+            toast.error("Ljudfilen är raderad — molnsynk kräver ljudet. Transkript och analys finns kvar.");
+            return;
+        }
+        const token = getToken();
+        if (!token) { toast.error("Logga in för att synka till molnet."); return; }
+        setSyncingId(rec.id);
+        try {
+            toast.info("Synkar till molnet...");
+            const job = await uploadJob(rec.file_path, "general", token, true, true);
+            await invoke("update_recording_status", { id: rec.id, status: 'uploaded', cloudJobId: job.id });
+            toast.success("Synkad till molnet — visas nu i dashboarden på sagt.ai.");
+            // Optimistisk uppdatering så raden blir "Synkad" direkt — utan att kräva flikbyte/remount.
+            setRecordings(prev => prev.map(r => r.id === rec.id ? { ...r, sync_status: 'uploaded', cloud_job_id: job.id } : r));
+            loadRecordings();
+        } catch (err: any) {
+            if (err?.message?.includes("Payment Required")) toast.error("Molnsynk kräver Pro.");
+            else if (err?.message?.startsWith("Unauthorized")) toast.error("Din session är inte längre giltig. Logga in igen.");
+            else toast.error("Synk misslyckades: " + (err?.message || "okänt fel"));
+        } finally {
+            setSyncingId(null);
+        }
+    };
+
     const formatDuration = (seconds: number) => {
         const h = Math.floor(seconds / 3600);
         const m = Math.floor((seconds % 3600) / 60);
@@ -96,13 +138,13 @@ export function RecordingsPage({ onViewChange }: { onViewChange: (view: 'dashboa
     };
 
     return (
-        <div className="flex flex-col h-full bg-slate-50 overflow-y-auto">
+        <div className="flex flex-col h-full bg-paper-dim overflow-y-auto">
             <header className="px-8 py-6 border-b bg-white">
-                <h1 className="text-2xl font-bold tracking-tight text-slate-900">Inspelningar</h1>
+                <h1 className="text-2xl font-bold tracking-tight text-ink">Inspelningar</h1>
                 <p className="text-muted-foreground mt-1">Dina lokala inspelningar och deras synk-status (SQLite Persisted).</p>
             </header>
 
-            <div className="p-8 max-w-5xl">
+            <div className="p-8 max-w-6xl">
                 <div className="bg-white rounded-lg border shadow-sm overflow-hidden">
                     {recordings.length === 0 ? (
                         <div className="p-12 text-center text-muted-foreground">
@@ -112,46 +154,106 @@ export function RecordingsPage({ onViewChange }: { onViewChange: (view: 'dashboa
                     ) : (
                         <div className="overflow-x-auto">
                             <table className="w-full text-sm text-left">
-                                <thead className="bg-slate-50 border-b text-slate-500 font-medium">
+                                <thead className="bg-paper-dim border-b text-ink-muted font-medium">
                                     <tr>
                                         <th className="px-6 py-3">Datum</th>
                                         <th className="px-6 py-3">Filnamn</th>
                                         <th className="px-6 py-3">Längd</th>
-                                        <th className="px-6 py-3">Status</th>
+                                        <th className="px-6 py-3">Ljud</th>
+                                        <th className="px-6 py-3">Transkribering & analys</th>
+                                        <th className="px-6 py-3">Moln</th>
                                         <th className="px-6 py-3 text-right">Åtgärd</th>
                                     </tr>
                                 </thead>
-                                <tbody className="divide-y divide-slate-100">
+                                <tbody className="divide-y divide-line">
                                     {recordings.map((rec) => (
                                         <tr
                                             key={rec.id}
-                                            className="hover:bg-indigo-50/50 transition-colors group cursor-pointer"
+                                            className="hover:bg-brand/5 transition-colors group cursor-pointer"
                                             onClick={() => handleLoad(rec)}
                                         >
                                             <td className="px-6 py-4 whitespace-nowrap">
                                                 {format(new Date(rec.created_at), "d MMMM yyyy, HH:mm", { locale: sv })}
                                             </td>
-                                            <td className="px-6 py-4 font-mono text-xs text-slate-600 truncate max-w-[200px]">
+                                            <td className="px-6 py-4 font-mono text-xs text-ink-soft truncate max-w-[200px]">
                                                 {rec.filename}
                                             </td>
-                                            <td className="px-6 py-4 font-mono text-slate-600">
+                                            <td className="px-6 py-4 font-mono text-ink-soft">
                                                 {formatDuration(rec.duration_sec)}
                                             </td>
+                                            {/* En statusdimension per kolumn, en bubbla per cell —
+                                                Ljud (lokal fil), Transkribering & analys (lokal text), Moln (synk). */}
                                             <td className="px-6 py-4">
-                                                {rec.sync_status === 'uploaded' || rec.cloud_job_id ? (
-                                                    <span className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-xs font-medium bg-green-50 text-green-700 border border-green-200">
+                                                {rec.audio_deleted ? (
+                                                    <span
+                                                        className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-xs font-medium bg-paper-dim text-ink-muted border border-line"
+                                                        title="Ljudfilen har gallrats — transkript och analys finns kvar"
+                                                    >
+                                                        <FileAudio className="w-3 h-3" />
+                                                        Raderad
+                                                    </span>
+                                                ) : (
+                                                    <span className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-xs font-medium bg-verified/10 text-verified border border-verified/20">
+                                                        <FileAudio className="w-3 h-3" />
+                                                        Finns
+                                                    </span>
+                                                )}
+                                            </td>
+                                            <td className="px-6 py-4">
+                                                {rec.has_segments || rec.analysis_json ? (
+                                                    <span
+                                                        className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-xs font-medium bg-verified/10 text-verified border border-verified/20"
+                                                        title="Transkribering och analys finns kvar lokalt"
+                                                    >
+                                                        <FileText className="w-3 h-3" />
+                                                        Finns kvar
+                                                    </span>
+                                                ) : (
+                                                    <span className="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-paper-dim text-ink-muted border border-line">
+                                                        –
+                                                    </span>
+                                                )}
+                                            </td>
+                                            <td className="px-6 py-4">
+                                                {syncingId === rec.id ? (
+                                                    <span className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-xs font-medium bg-brand/10 text-brand border border-brand/20">
+                                                        <CloudUpload className="w-3 h-3 animate-pulse" />
+                                                        Synkar…
+                                                    </span>
+                                                ) : rec.sync_status === 'uploaded' || rec.cloud_job_id ? (
+                                                    <span className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-xs font-medium bg-verified/10 text-verified border border-verified/20">
                                                         <Cloud className="w-3 h-3" />
                                                         Synkad
                                                     </span>
-                                                ) : (
-                                                    <span className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-xs font-medium bg-yellow-50 text-yellow-700 border border-yellow-200">
+                                                ) : !rec.audio_deleted ? (
+                                                    <span className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-xs font-medium bg-ochre-soft text-ochre border border-ochre/20">
                                                         <CloudUpload className="w-3 h-3" />
                                                         Ej synkad
+                                                    </span>
+                                                ) : (
+                                                    /* Gallrad och aldrig synkad: synk är omöjlig — visa neutral
+                                                       tomstatus istället för en "Ej synkad" som inte går att åtgärda. */
+                                                    <span className="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-paper-dim text-ink-muted border border-line">
+                                                        –
                                                     </span>
                                                 )}
                                             </td>
                                             <td className="px-6 py-4 text-right">
                                                 <div className="flex items-center justify-end gap-2 opacity-0 group-hover:opacity-100 transition-opacity">
+                                                    {/* Synk laddar upp WAV:en — omöjligt när ljudfilen är gallrad */}
+                                                    {isPro && !rec.audio_deleted && !(rec.sync_status === 'uploaded' || rec.cloud_job_id) && (
+                                                        <Button
+                                                            size="sm"
+                                                            variant="ghost"
+                                                            disabled={syncingId === rec.id}
+                                                            onClick={(e) => { e.stopPropagation(); handleSync(rec); }}
+                                                            className="h-8 px-2 text-xs text-brand hover:bg-brand/5 disabled:opacity-50"
+                                                            title="Synka till molnet (visas i dashboarden)"
+                                                        >
+                                                            <CloudUpload className="w-4 h-4 mr-1" />
+                                                            {syncingId === rec.id ? "Synkar..." : "Synka"}
+                                                        </Button>
+                                                    )}
                                                     <Button
                                                         size="sm"
                                                         variant="ghost"
