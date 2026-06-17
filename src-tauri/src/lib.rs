@@ -222,6 +222,17 @@ fn save_cloud_transcript_to_db(
     db.save_cloud_transcript(id, transcript)
 }
 
+// JS anropar med camelCase: invoke("save_speaker_map_to_db", { id, speakerMap })
+#[tauri::command]
+fn save_speaker_map_to_db(
+    state: tauri::State<'_, Mutex<DatabaseManager>>,
+    id: i64,
+    speaker_map: String,
+) -> Result<(), String> {
+    let db = state.lock().map_err(|e| e.to_string())?;
+    db.save_speaker_map(id, speaker_map)
+}
+
 #[tauri::command]
 fn get_storage_usage(
     state: tauri::State<'_, Mutex<DatabaseManager>>,
@@ -303,6 +314,7 @@ pub fn run() {
             update_recording_status,
             save_analysis_to_db,
             save_cloud_transcript_to_db,
+            save_speaker_map_to_db,
             get_storage_usage,
             cleanup_audio_storage
         ])

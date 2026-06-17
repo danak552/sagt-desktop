@@ -2,9 +2,6 @@ import { useEffect } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { useTranscriptionStore, UISegment } from "@/store/transcription-store";
 import { toast } from "sonner";
-import posthog from "posthog-js";
-
-const posthogEnabled = !!import.meta.env.VITE_POSTHOG_KEY;
 
 interface TranscriptionEvent {
     text: string;
@@ -34,22 +31,15 @@ export function useTranscription() {
             };
 
             addSegment(newSegment);
-            // isProcessing styrs enbart av transcription-status-eventet (idle/processing).
-            // Att sätta false här fick "Avbryt"-knappen att försvinna mitt i pågående
-            // transkribering när beam-size 1 levererar chunks snabbt.
+            // Sätt INTE isProcessing(false) här: med beam-size 1 levereras chunks snabbt och
+            // det fick "Avbryt"-knappen att försvinna mitt i pågående transkribering.
+            // isProcessing styrs av control-bar (start/stop + history-updated) och use-cloud-stream.
         });
 
-        const unlistenStatusPromise = listen<string>("transcription-status", (event) => {
-            console.log("React: Status update", event.payload);
-            setIsProcessing(event.payload === "processing");
-            if (event.payload === "idle" && posthogEnabled) {
-                const segs = useTranscriptionStore.getState().segments
-                if (segs.length > 0) {
-                    const wordCount = segs.reduce((n, s) => n + s.text.split(' ').length, 0)
-                    posthog.capture('transcription_completed', { word_count: wordCount })
-                }
-            }
-        });
+        // transcription-status togs bort från Rust i "Refactor persistence to be
+        // backend-driven" (6e7f02b) → history-updated ersatte den. isProcessing styrs nu
+        // av control-bar (start/stop + history-updated) och use-cloud-stream; det lokala
+        // transcription_completed-eventet fyras i control-bars history-updated-lyssnare.
 
         const unlistenErrorPromise = listen<string>("transcription-error", (event) => {
             console.error("React: Transcription Error", event.payload);
@@ -61,7 +51,6 @@ export function useTranscription() {
 
         return () => {
             unlistenChunkPromise.then((unlisten) => unlisten());
-            unlistenStatusPromise.then((unlisten) => unlisten());
             unlistenErrorPromise.then((unlisten) => unlisten());
         };
     }, []);

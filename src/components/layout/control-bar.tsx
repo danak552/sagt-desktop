@@ -106,6 +106,41 @@ export function ControlBar({ onViewChange }: ControlBarProps) {
                 setUploadStatus('idle');
                 setActiveJob(recording);
                 useTranscriptionStore.getState().setIsProcessing(false);
+
+                // Flusha talarnamn/chips som fyllts i UNDER live (buffrade i store, ej i den nu
+                // ev. avmonterade SplitView). Körs för BÅDE lokal och moln, FÖRE den cloud-
+                // streaming-gren som return:ar nedan. Lokal transkribering sparar inspelningen
+                // asynkront efter stopp — ofta efter att användaren bytt flik (SplitView avmonterad)
+                // → SplitViews egen persistens hinner inte. ControlBar är alltid monterad.
+                {
+                    const pending = useSyncStore.getState().pendingSpeakerData;
+                    if (pending && (Object.keys(pending.map).length > 0 || pending.participants.length > 0)) {
+                        try {
+                            const payload = JSON.stringify({ map: pending.map, participants: pending.participants });
+                            await invoke("save_speaker_map_to_db", { id: recording.id, speakerMap: payload });
+                            useSyncStore.getState().setPendingSpeakerData(null);
+                            const aj = useSyncStore.getState().activeJob;
+                            if (aj && aj.id === recording.id) {
+                                setActiveJob({ ...aj, speaker_map: payload }, useSyncStore.getState().activeJobFromHistory);
+                            }
+                        } catch (e) {
+                            console.error("Failed to flush pending speaker_map:", e);
+                        }
+                    }
+                }
+
+                // transcription_completed (lokal/gratis): sista steget i free-aktiveringsfunneln.
+                // history-updated fyrar när Rust sparat den lokalt transkriberade inspelningen
+                // (whisper-cli, pending=0). PRO live-molnströmning har egna server-events
+                // (transcription_chunk_completed/cloud_chunk_ok) och hanteras i grenen nedan —
+                // fyra därför bara när vi INTE strömmar mot molnet, annars dubbelräknas sessionen.
+                if (!useSyncStore.getState().cloudStreamingActive) {
+                    const segs = useTranscriptionStore.getState().segments;
+                    if (segs.length > 0) {
+                        const wordCount = segs.reduce((n, s) => n + s.text.split(" ").length, 0);
+                        events.transcriptionCompleted(wordCount);
+                    }
+                }
                 
                 // --- AUTO-SYNC LOGIC ---
                 // Trigger auto-sync if effective mode says we should use cloud, and we are Pro
@@ -270,6 +305,7 @@ export function ControlBar({ onViewChange }: ControlBarProps) {
                 setActiveJob(null);
                 setSession(null, null);
                 reset(); // Clears uploadedJobId, processingStatus, analysisData, uploadStatus
+                useSyncStore.getState().setPendingSpeakerData(null); // nollställ talar-buffert för ny session
             }
         } catch (error: any) {
             console.error("Failed to toggle recording:", error);

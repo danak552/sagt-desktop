@@ -18,12 +18,18 @@ interface SyncState {
     analysisData: AnalysisData | null;
     activeJob: any | null; // Stores the full recording object when selected from history
     activeJobFromHistory: boolean; // true only when user explicitly opened from history list
+    // Buffert för talarnamn/chips ifyllda UNDER live (inget DB-id än). Ligger i den globala
+    // store:n — INTE i SplitView-state — så den överlever att SplitView avmonteras vid flikbyte.
+    // Lokal transkribering sparar inspelningen asynkront efter stopp (ofta efter ett flikbyte),
+    // så ControlBar (alltid monterad) flushar bufferten till DB vid history-updated.
+    pendingSpeakerData: { map: Record<string, string>; participants: string[] } | null;
 
     // Smart Recording Journey states
     effectiveMode: 'cloud_analysis' | 'cloud' | 'local';
     isOnline: boolean;
 
     setActiveJob: (job: any | null, fromHistory?: boolean) => void;
+    setPendingSpeakerData: (data: { map: Record<string, string>; participants: string[] } | null) => void;
     setEffectiveMode: (mode: 'cloud_analysis' | 'cloud' | 'local') => void;
     setIsOnline: (status: boolean) => void;
     setUploadStatus: (status: 'idle' | 'uploading' | 'success' | 'error') => void;
@@ -57,6 +63,7 @@ export const useSyncStore = create<SyncState>((set) => ({
     analysisData: null,
     activeJob: null,
     activeJobFromHistory: false,
+    pendingSpeakerData: null,
     effectiveMode: 'local', // Default, updated on mount/settings change
     isOnline: true,
 
@@ -77,6 +84,7 @@ export const useSyncStore = create<SyncState>((set) => ({
     cloudStreamingActive: false,
     setCloudStreamingActive: (val) => set({ cloudStreamingActive: val }),
     setActiveJob: (job, fromHistory = false) => set({ activeJob: job, activeJobFromHistory: fromHistory }),
+    setPendingSpeakerData: (data) => set({ pendingSpeakerData: data }),
     reset: () => set({
         uploadedJobId: null,
         processingStatus: null,
@@ -88,6 +96,7 @@ export const useSyncStore = create<SyncState>((set) => ({
     resetToLive: () => set({
         activeJob: null,
         activeJobFromHistory: false,
+        pendingSpeakerData: null,
         analysisData: null,
         uploadedJobId: null,
         processingStatus: null,
@@ -105,5 +114,6 @@ export const useSyncStore = create<SyncState>((set) => ({
         analysisData: null,
         activeJob: null,
         activeJobFromHistory: false,
+        pendingSpeakerData: null,
     }),
 }));

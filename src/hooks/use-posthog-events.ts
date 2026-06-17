@@ -26,6 +26,10 @@ export function usePostHogEvents() {
         analysisFailed: (error: string) =>
             captureEvent('analysis_failed', { error }),
 
+        // Klient-intent; backend emitterar auktoritativa 'speakers_identified' vid lyckat svar.
+        speakersIdentifyRequested: () =>
+            captureEvent('speakers_identify_requested'),
+
         upsellShown: (trigger: string) =>
             captureEvent('upsell_shown', { trigger }),
 

@@ -37,30 +37,51 @@ export function AppGuard({ children }: { children: React.ReactNode }) {
         validateAccess()
     }, [])
 
-    const validateAccess = async () => {
+    // Delad config-applicering — används av både första kollen och bakgrundsuppdateringen.
+    const applyConfig = (data: any) => {
+        if (data.download_url) {
+            setDownloadUrl(data.download_url)
+            setDownloadUrlStore(data.download_url)
+        }
+        if (data.stripe_payment_link) setStripePaymentLink(data.stripe_payment_link)
+        if (data.motd) setMotd(data.motd)
+        if (data.latest_version) setLatestVersion(data.latest_version)
+    }
+
+    // Hämta config i bakgrunden (utan timeout) EFTER att en registrerad användare släppts in
+    // via offline-toleransen — uppdaterar motd/version/länkar utan att blockera starten. Rör
+    // aldrig guard-state (ingen oväntad UPDATE_REQUIRED mitt i sessionen).
+    const refreshConfigInBackground = async () => {
         try {
-            const res = await fetch(`${API_URL}/system/config`, {
-                headers: { "Cache-Control": "no-cache" }
-            })
+            const res = await fetch(`${API_URL}/system/config`, { headers: { "Cache-Control": "no-cache" } })
+            if (res.ok) applyConfig(await res.json())
+        } catch {
+            /* tyst — appen är redan READY */
+        }
+    }
 
-            // Backend is unreachable or returned non-200. Assume offline/network error.
-            if (!res.ok) throw new Error("Network response was not ok")
+    const validateAccess = async () => {
+        const hasLicense = localStorage.getItem("sagt_beta_license")
+        try {
+            // Cloud Run kör min-0 → första anropet efter inaktivitet är en cold start (10–30 s).
+            // Utan timeout frös appen i CHECKING tills containern vaknat ("not responding"). Vänta
+            // max 4 s; därefter släpps en redan registrerad användare in direkt (offline-tolerans)
+            // och config hämtas i bakgrunden. Offline/nätfel går samma väg.
+            const controller = new AbortController()
+            const timer = setTimeout(() => controller.abort(), 4000)
+            let data: any
+            try {
+                const res = await fetch(`${API_URL}/system/config`, {
+                    headers: { "Cache-Control": "no-cache" },
+                    signal: controller.signal,
+                })
+                if (!res.ok) throw new Error("Network response was not ok")
+                data = await res.json()
+            } finally {
+                clearTimeout(timer)
+            }
 
-            const data = await res.json()
-
-            if (data.download_url) {
-                setDownloadUrl(data.download_url)
-                setDownloadUrlStore(data.download_url)
-            }
-            if (data.stripe_payment_link) {
-                setStripePaymentLink(data.stripe_payment_link)
-            }
-            if (data.motd) {
-                setMotd(data.motd)
-            }
-            if (data.latest_version) {
-                setLatestVersion(data.latest_version)
-            }
+            applyConfig(data)
 
             if (data.maintenance_mode) {
                 setMaintenanceMessage(data.message || "Sagt.ai genomgår tillfälligt underhåll.")
@@ -78,11 +99,11 @@ export function AppGuard({ children }: { children: React.ReactNode }) {
             verifyLicense()
 
         } catch (error) {
-            console.error("AppGuard: Network check failed, applying Offline Tolerance...", error)
-            // OFFLINE TOLERANCE RULE
-            const hasLicense = localStorage.getItem("sagt_beta_license")
+            console.error("AppGuard: config-koll timeout/fel — tillämpar offline-tolerans...", error)
+            // OFFLINE TOLERANCE RULE — registrerad användare blockeras aldrig av en kall/långsam backend.
             if (hasLicense) {
                 setState('READY')
+                refreshConfigInBackground()
             } else {
                 setState('OFFLINE_BLOCKED')
             }

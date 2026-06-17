@@ -1,6 +1,6 @@
 // Removed ScrollArea import
 import { Card } from "@/components/ui/card";
-import { FileText, Sparkles, History, Loader2, Copy, RefreshCw, Play, Cloud, Check, LogOut, Lock } from "lucide-react";
+import { FileText, Sparkles, History, Loader2, Copy, RefreshCw, Play, Cloud, Check, LogOut, Lock, Users, X } from "lucide-react";
 import { useTranscription } from "@/hooks/use-transcription";
 import { cancelCloudStream } from "@/hooks/use-cloud-stream";
 import { useSyncStore } from "@/store/sync-store";
@@ -9,7 +9,7 @@ import { useTranscriptionStore, UISegment } from "@/store/transcription-store";
 import { invoke } from "@tauri-apps/api/core";
 import { useEffect, useRef, useState, useMemo } from "react";
 import { Button } from "@/components/ui/button";
-import { getJob, reanalyzeTranscript, reanalyzeJob, uploadJob } from "@/lib/api";
+import { getJob, reanalyzeTranscript, reanalyzeJob, uploadJob, identifySpeakers, SpeakerTurn } from "@/lib/api";
 import { applyInlineCloudResult } from "@/lib/cloud-sync";
 import { AnalysisData } from "@/store/sync-store";
 import { useAuthStore } from "@/store/auth-store";
@@ -132,10 +132,28 @@ export function SplitView() {
         return paras;
     }, [isMerged, segments, pauseBreakMs]);
 
+    // Talaridentifiering (Fas 1): namnmappning (kanonisk etikett → namn) + deltagarlista.
+    // Icke-förstörande — segmenten rörs aldrig, namnen appliceras ovanpå Du/Mötet i vyn.
+    const [speakerMap, setSpeakerMap] = useState<Record<string, string>>({});
+    const [participants, setParticipants] = useState<string[]>([]);
+    const [editingTurnIndex, setEditingTurnIndex] = useState<number | null>(null);
+    const [editingName, setEditingName] = useState("");
+    const [newParticipant, setNewParticipant] = useState("");
+    const [isIdentifying, setIsIdentifying] = useState(false);
+
+    // Kanonisk etikett: mic/DU → "DU", sys/MÖTET → "MÖTET" (segment kan bära endera formen).
+    // Mappning och hints nycklas på den kanoniska formen så de två varianterna inte splittras.
+    const speakerKey = (sp: string) =>
+        (sp === "mic" || sp === "DU") ? "DU" : (sp === "sys" || sp === "MÖTET") ? "MÖTET" : sp;
+    const defaultLabel = (sp: string) => {
+        const k = speakerKey(sp);
+        return k === "DU" ? "Du" : k === "MÖTET" ? "Mötet" : sp;
+    };
+
     // #9: gruppera på varandra följande segment med SAMMA talare till en "tur" (som mockupen
     // på startsidan): fet "Mötet:"/"Du:" inline + text, ny tur bara vid talarbyte eller paus.
-    const speakerLabel = (sp: string) =>
-        (sp === "mic" || sp === "DU") ? "Du" : (sp === "sys" || sp === "MÖTET") ? "Mötet" : sp;
+    // Namnet hämtas ur speakerMap (kanonisk nyckel), annars Du/Mötet-default.
+    const speakerLabel = (sp: string) => speakerMap[speakerKey(sp)] || defaultLabel(sp);
     const turns = useMemo(() => {
         const out: { speaker: string; text: string; start_time: number; end_time: number }[] = [];
         for (const s of segments) {
@@ -153,6 +171,10 @@ export function SplitView() {
         }
         return out;
     }, [segments, pauseBreakMs]);
+
+    // Det finns talaretiketter att namnsätta (Du/Mötet/Talare-N) — inte sammanhängande
+    // molntext (MOLN, ett enda flöde utan talare). Styr chips-raden + "Identifiera talare".
+    const hasNamableSpeakers = !isMerged && turns.some(t => t.speaker !== "MOLN");
 
     // Kopiera EXAKT det som visas i vyn: samma turer (gruppering per talare) som renderas,
     // inte ett prefix per råsegment/mening. Merged-läget kopierar styckena.
@@ -258,6 +280,127 @@ export function SplitView() {
             }
         } finally {
             setIsRetranscribing(false);
+        }
+    };
+
+    // Ladda persisterad namnmappning + deltagarlista. SPARAD inspelning (öppnad från historik):
+    // läs recordings.speaker_map. Live→sparad (fromHistory=false) hanteras INTE här — ControlBar
+    // flushar den live-buffrade datan (pendingSpeakerData i store) vid history-updated, eftersom
+    // SplitView kan vara avmonterad när lokal transkribering sparar inspelningen efter stopp.
+    useEffect(() => {
+        if (!activeJob) { setSpeakerMap({}); setParticipants([]); return; }
+        if (!useSyncStore.getState().activeJobFromHistory) return;
+        const raw = activeJob.speaker_map;
+        if (!raw) { setSpeakerMap({}); setParticipants([]); return; }
+        try {
+            const parsed = JSON.parse(raw);
+            setSpeakerMap(parsed?.map && typeof parsed.map === 'object' ? parsed.map : {});
+            setParticipants(Array.isArray(parsed?.participants) ? parsed.participants : []);
+        } catch { setSpeakerMap({}); setParticipants([]); }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [activeJob?.id, activeJob?.speaker_map]);
+
+    // Persistera namnmappning + deltagarlista. SPARAD inspelning (id finns) → skriv direkt till
+    // recordings.speaker_map. LIVE (inget id än) → buffra i global store; ControlBar flushar den
+    // vid history-updated (alltid monterad → fungerar även när SplitView avmonterats vid flikbyte,
+    // vilket händer i lokalt läge där inspelningen sparas asynkront efter stopp).
+    const persistSpeakerData = async (map: Record<string, string>, parts: string[]) => {
+        const id = activeJob?.id ?? (currentSessionId ? parseInt(currentSessionId) : null);
+        if (!id) {
+            useSyncStore.getState().setPendingSpeakerData({ map, participants: parts });
+            return;
+        }
+        const payload = JSON.stringify({ map, participants: parts });
+        try {
+            // camelCase: Rust-param speaker_map → speakerMap i JS-invoke (annars None tyst).
+            await invoke("save_speaker_map_to_db", { id, speakerMap: payload });
+            useSyncStore.getState().setPendingSpeakerData(null);
+            const aj = useSyncStore.getState().activeJob;
+            // Bevara fromHistory-flaggan (annars tappas historik-bannern vid namnbyte).
+            if (aj && aj.id === id) setActiveJob({ ...aj, speaker_map: payload }, useSyncStore.getState().activeJobFromHistory);
+        } catch (e) {
+            console.error("Failed to persist speaker map:", e);
+        }
+    };
+
+    const openRename = (turnIndex: number, sp: string) => {
+        const k = speakerKey(sp);
+        // "Du" förifyller fältet med e-postens lokaldel (auth-store har bara e-post) — ett
+        // förslag som bekräftas med Enter, inte ett auto-applicerat namn.
+        const prefill = speakerMap[k] || (k === "DU" && email ? email.split("@")[0] : "");
+        setEditingName(prefill);
+        setEditingTurnIndex(turnIndex);
+    };
+
+    const cancelRename = () => {
+        setEditingTurnIndex(null);
+        setEditingName("");
+    };
+
+    const commitRename = (sp: string) => {
+        const k = speakerKey(sp);
+        const name = editingName.trim();
+        const next = { ...speakerMap };
+        if (name) next[k] = name; else delete next[k];
+        setSpeakerMap(next);
+        persistSpeakerData(next, participants);
+        cancelRename();
+    };
+
+    const addParticipant = () => {
+        const name = newParticipant.trim();
+        if (!name || participants.includes(name)) { setNewParticipant(""); return; }
+        const next = [...participants, name];
+        setParticipants(next);
+        persistSpeakerData(speakerMap, next);
+        setNewParticipant("");
+    };
+
+    const removeParticipant = (name: string) => {
+        const next = participants.filter(p => p !== name);
+        setParticipants(next);
+        persistSpeakerData(speakerMap, next);
+    };
+
+    // "Identifiera talare": LLM-förslag som FÖRIFYLLER etiketterna (Pro + online-guard,
+    // samma mönster som handleRetranscribe). Användaren korrigerar genom att klicka.
+    const handleIdentifySpeakers = async () => {
+        if (!isSignedIn || !isPro) { setShowUpsellModal(true); return; }
+        if (!navigator.onLine) { toast.error("Denna funktion kräver internetanslutning."); return; }
+        const token = getToken();
+        if (!token) { toast.error("Kunde inte hämta autentiseringstoken. Logga in igen."); return; }
+
+        // Skicka kanoniska etiketter; hoppa över MOLN (sammanhängande molntext har inga talare).
+        const apiTurns: SpeakerTurn[] = turns
+            .filter(t => t.speaker !== "MOLN")
+            .map(t => ({ speaker: speakerKey(t.speaker), text: t.text, start: t.start_time ?? null }));
+        if (apiTurns.length === 0) { toast.error("Inga talarsegment att identifiera."); return; }
+
+        setIsIdentifying(true);
+        events.speakersIdentifyRequested();
+        try {
+            const result = await identifySpeakers(apiTurns, participants, token);
+            const suggested = result.speaker_map || {};
+            const count = Object.keys(suggested).length;
+            if (count === 0) {
+                toast.info("Kunde inte härleda namn ur samtalet. Klicka på en etikett för att namnge manuellt.");
+            } else {
+                const next = { ...speakerMap, ...suggested };
+                setSpeakerMap(next);
+                persistSpeakerData(next, participants);
+                toast.success(`Identifierade ${count} talare. Klicka på ett namn för att ändra.`);
+            }
+        } catch (error: any) {
+            if (error?.message?.startsWith("Unauthorized")) {
+                clearSession();
+                toast.error("Din session är inte längre giltig. Logga in igen.");
+            } else if (error?.message?.includes("Payment Required")) {
+                setShowUpsellModal(true);
+            } else {
+                toast.error("Talaridentifiering misslyckades: " + (error?.message || "Okänt fel"));
+            }
+        } finally {
+            setIsIdentifying(false);
         }
     };
 
@@ -632,6 +775,21 @@ export function SplitView() {
                                 }
                             </Button>
                         )}
+                        {/* Identifiera talare (Fas 1) — namnsätter Du/Mötet via LLM. Visas bara
+                            när det finns talaretiketter att namnge, inte under inspelning.
+                            Pro/online-guard hanteras i handlern (samma mönster som omtranskribera). */}
+                        {segments.length > 0 && !isRecording && hasNamableSpeakers && (
+                            <Button
+                                variant="ghost"
+                                size="icon"
+                                className="h-6 w-6 text-ink-muted hover:text-brand hover:bg-brand/5 ml-0.5 rounded-full"
+                                onClick={handleIdentifySpeakers}
+                                disabled={isIdentifying}
+                                title={isPro ? "Identifiera talare — namnsätt Du/Mötet" : "Identifiera talare (Pro)"}
+                            >
+                                {isIdentifying ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Users className="h-3.5 w-3.5" />}
+                            </Button>
+                        )}
                     </h2>
                     <div className="flex items-center gap-3">
                         <ModePill onUpsellClick={() => setShowUpsellModal(true)} />
@@ -738,22 +896,93 @@ export function SplitView() {
                                         🖥 Lokalt (molnet ej tillgängligt)
                                     </span>
                                 )}
+                                {/* Click-outside: stänger en öppen namnbyte-popover. z under popovern (z-50). */}
+                                {editingTurnIndex !== null && (
+                                    <div className="fixed inset-0 z-40" onClick={cancelRename} />
+                                )}
+                                {/* Deltagar-chips (frivilligt) — "Vilka är med?". Skickas som
+                                    participant_hints vid identifiering + snabbval i namnbyte-popovern. */}
+                                {hasNamableSpeakers && (
+                                    <div className="flex flex-wrap items-center gap-1.5 mb-4 pb-3 border-b border-line/60">
+                                        <Users className="w-3.5 h-3.5 text-ink-muted mr-0.5" />
+                                        <span className="text-xs text-ink-muted mr-1">Vilka är med?</span>
+                                        {participants.map((p) => (
+                                            <span key={p} className="inline-flex items-center gap-1 text-xs bg-brand/5 text-brand border border-brand/10 rounded-full pl-2.5 pr-1 py-0.5">
+                                                {p}
+                                                <button onClick={() => removeParticipant(p)} className="hover:bg-brand/10 rounded-full p-0.5" title="Ta bort">
+                                                    <X className="w-2.5 h-2.5" />
+                                                </button>
+                                            </span>
+                                        ))}
+                                        <input
+                                            value={newParticipant}
+                                            onChange={(e) => setNewParticipant(e.target.value)}
+                                            onKeyDown={(e) => { if (e.key === 'Enter') { e.preventDefault(); addParticipant(); } }}
+                                            onBlur={addParticipant}
+                                            placeholder="Lägg till namn…"
+                                            className="text-xs bg-transparent border-b border-dashed border-line focus:border-brand outline-none px-1 py-0.5 w-28 text-ink placeholder:text-ink-muted/60"
+                                        />
+                                    </div>
+                                )}
                                 {turns.map((turn, index, arr) => {
                                     // Pausbryt: extra luft när gapet till föregående tur ≥ pauseBreakMs.
                                     const prev = arr[index - 1];
                                     const pauseBreak = !!prev && (turn.start_time - prev.end_time) * 1000 >= pauseBreakMs;
                                     const isDu = turn.speaker === "DU" || turn.speaker === "mic";
                                     const isMoln = turn.speaker === "MOLN";
+                                    const isEditing = editingTurnIndex === index;
                                     return (
                                         <p
                                             key={index}
                                             className={`leading-relaxed text-[15px] animate-in fade-in slide-in-from-bottom-1 duration-500 fill-mode-backwards ${pauseBreak ? 'mt-5' : 'mt-1.5'}`}
                                         >
                                             {!isMoln && (
-                                                <span className={`font-semibold ${isDu ? "text-brand" : "text-rose-600"}`}>
-                                                    {speakerLabel(turn.speaker)}:{" "}
+                                                <span className="relative inline-block">
+                                                    <button
+                                                        type="button"
+                                                        onClick={() => openRename(index, turn.speaker)}
+                                                        className={`font-semibold rounded hover:underline decoration-dotted underline-offset-2 transition-colors ${isDu ? "text-brand" : "text-rose-600"}`}
+                                                        title="Klicka för att namnge talaren"
+                                                    >
+                                                        {speakerLabel(turn.speaker)}:
+                                                    </button>
+                                                    {/* Namnbyte-popover (span-only inuti <p>; div är ogiltigt i p) */}
+                                                    {isEditing && (
+                                                        <span className="absolute left-0 top-full mt-1 z-50 flex flex-col gap-2 bg-white border border-line rounded-lg shadow-lg p-3 w-64 font-normal normal-case text-left">
+                                                            <input
+                                                                autoFocus
+                                                                value={editingName}
+                                                                onChange={(e) => setEditingName(e.target.value)}
+                                                                onKeyDown={(e) => {
+                                                                    if (e.key === 'Enter') { e.preventDefault(); commitRename(turn.speaker); }
+                                                                    if (e.key === 'Escape') { e.preventDefault(); cancelRename(); }
+                                                                }}
+                                                                placeholder={`Namn för "${defaultLabel(turn.speaker)}"`}
+                                                                className="text-sm border border-line rounded-md px-2 py-1 outline-none focus:border-brand text-ink"
+                                                            />
+                                                            {participants.length > 0 && (
+                                                                <span className="flex flex-wrap gap-1">
+                                                                    {participants.map((p) => (
+                                                                        <button
+                                                                            key={p}
+                                                                            type="button"
+                                                                            onClick={() => setEditingName(p)}
+                                                                            className="text-xs bg-paper-dim hover:bg-brand/10 text-ink-soft hover:text-brand border border-line rounded-full px-2 py-0.5"
+                                                                        >
+                                                                            {p}
+                                                                        </button>
+                                                                    ))}
+                                                                </span>
+                                                            )}
+                                                            <span className="flex items-center justify-end gap-2">
+                                                                <button type="button" onClick={cancelRename} className="text-xs text-ink-muted hover:text-ink-soft px-2 py-1">Avbryt</button>
+                                                                <button type="button" onClick={() => commitRename(turn.speaker)} className="text-xs font-medium bg-brand text-paper rounded-md px-3 py-1 hover:bg-brand-deep">Spara</button>
+                                                            </span>
+                                                        </span>
+                                                    )}
                                                 </span>
                                             )}
+                                            {!isMoln && " "}
                                             <span className="text-ink-soft">{turn.text}</span>
                                         </p>
                                     );

@@ -19,6 +19,11 @@ pub struct Recording {
     /// KB-Whisper Large-resultat (moln). Lagras separat från de lokala segmenten så
     /// användaren kan växla mellan modellernas resultat för samma inspelning.
     pub cloud_transcript: Option<String>,
+    /// Talaridentifiering (Fas 1) — JSON `{ "map": {etikett→namn}, "participants": [...] }`.
+    /// Icke-förstörande: segmenten lämnas orörda, UI:t applicerar namnen ovanpå Du/Mötet.
+    /// serde(default) — `save_recording_to_db` skickar inte fältet vid första sparningen.
+    #[serde(default)]
+    pub speaker_map: Option<String>,
     /// Ljudfilen har gallrats (auto-gallring). DB-raden med segment/analys behålls,
     /// men moln-omtranskribering och synk kräver ljudet och inaktiveras i UI.
     /// serde(default) — äldre frontend-anrop (save_recording_to_db) skickar inte fältet.
@@ -167,6 +172,17 @@ impl DatabaseManager {
             let _ = conn.execute("ALTER TABLE recordings ADD COLUMN audio_deleted INTEGER NOT NULL DEFAULT 0", []);
         }
 
+        // Migration: speaker_map — talaridentifiering (tilltalsnamn ovanpå Du/Mötet, Fas 1)
+        let speaker_map_col_exists: bool = conn.query_row(
+            "SELECT count(*) FROM pragma_table_info('recordings') WHERE name='speaker_map'",
+            [],
+            |row| row.get(0),
+        ).unwrap_or(0) > 0;
+
+        if !speaker_map_col_exists {
+            let _ = conn.execute("ALTER TABLE recordings ADD COLUMN speaker_map TEXT", []);
+        }
+
         Ok(())
     }
 
@@ -199,8 +215,8 @@ impl DatabaseManager {
 
         // 2. Insert Recording
         tx.execute(
-            "INSERT INTO recordings (filename, file_path, duration_sec, created_at, sync_status, cloud_job_id, analysis_json, ai_template_used, cloud_transcript, audio_deleted)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            "INSERT INTO recordings (filename, file_path, duration_sec, created_at, sync_status, cloud_job_id, analysis_json, ai_template_used, cloud_transcript, audio_deleted, speaker_map)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             params![
                 recording.filename,
                 recording.file_path,
@@ -211,7 +227,8 @@ impl DatabaseManager {
                 recording.analysis_json,
                 recording.ai_template_used,
                 recording.cloud_transcript,
-                recording.audio_deleted
+                recording.audio_deleted,
+                recording.speaker_map
             ],
         ).map_err(|e| e.to_string())?;
 
@@ -242,7 +259,7 @@ impl DatabaseManager {
 
     pub fn get_all_recordings(&self) -> Result<Vec<Recording>, String> {
         let conn = self.get_connection().map_err(|e| e.to_string())?;
-        let mut stmt = conn.prepare("SELECT id, filename, file_path, duration_sec, created_at, sync_status, cloud_job_id, analysis_json, ai_template_used, cloud_transcript, audio_deleted, EXISTS(SELECT 1 FROM segments WHERE segments.recording_id = recordings.id) FROM recordings ORDER BY created_at DESC").map_err(|e| e.to_string())?;
+        let mut stmt = conn.prepare("SELECT id, filename, file_path, duration_sec, created_at, sync_status, cloud_job_id, analysis_json, ai_template_used, cloud_transcript, audio_deleted, speaker_map, EXISTS(SELECT 1 FROM segments WHERE segments.recording_id = recordings.id) FROM recordings ORDER BY created_at DESC").map_err(|e| e.to_string())?;
 
         let recordings_iter = stmt.query_map([], |row| {
             Ok(Recording {
@@ -257,7 +274,8 @@ impl DatabaseManager {
                 ai_template_used: row.get(8)?,
                 cloud_transcript: row.get(9)?,
                 audio_deleted: row.get(10)?,
-                has_segments: row.get(11)?,
+                speaker_map: row.get(11)?,
+                has_segments: row.get(12)?,
             })
         }).map_err(|e| e.to_string())?;
 
@@ -370,6 +388,19 @@ impl DatabaseManager {
         conn.execute(
             "UPDATE recordings SET cloud_transcript = ?1 WHERE id = ?2",
             params![transcript, id]
+        ).map_err(|e| e.to_string())?;
+
+        Ok(())
+    }
+
+    /// Persistera talaridentifieringen (JSON: namnmappning + deltagarlista) för en
+    /// inspelning. Segmenten lämnas orörda — namnen appliceras ovanpå i frontend.
+    pub fn save_speaker_map(&self, id: i64, speaker_map: String) -> Result<(), String> {
+        let conn = self.get_connection().map_err(|e| e.to_string())?;
+
+        conn.execute(
+            "UPDATE recordings SET speaker_map = ?1 WHERE id = ?2",
+            params![speaker_map, id]
         ).map_err(|e| e.to_string())?;
 
         Ok(())

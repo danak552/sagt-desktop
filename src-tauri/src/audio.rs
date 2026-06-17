@@ -1853,6 +1853,7 @@ fn try_save_session(app: &AppHandle, session_state: &Arc<Mutex<SessionState>>) {
                 cloud_transcript: None,
                 sync_status: "local".to_string(),
                 audio_deleted: false,
+                speaker_map: None,
                 has_segments: !segments.is_empty(),
             };
             

@@ -301,3 +301,56 @@ export async function reanalyzeTranscript(text: string, templateId: string = "ge
         throw error;
     }
 }
+
+// ─── Talaridentifiering (Fas 1 — tilltalsnamn ovanpå Du/Mötet) ───────────────
+export interface SpeakerTurn {
+    speaker: string;
+    text: string;
+    start: number | null;
+}
+
+/**
+ * Icke-förstörande FÖRSLAG: backend rör aldrig turerna. speaker_map: etikett → namn;
+ * en utelämnad etikett behåller sitt originalnamn i UI:t. confidence: etikett → 0..1.
+ */
+export interface IdentifySpeakersResult {
+    speaker_map: Record<string, string>;
+    confidence: Record<string, number>;
+}
+
+/**
+ * POSTar turbaserat transkript + valfria deltagar-hints till /identify-speakers (Pro-gatad
+ * under pro_router) → LLM-infererad namnmappning. Kastar vid 401/402/413 så anroparen kan
+ * hantera auth/Pro/storlek. Speglar reanalyzeTranscript (JSON-body, Bearer-token).
+ */
+export async function identifySpeakers(
+    turns: SpeakerTurn[],
+    participantHints: string[],
+    token: string,
+): Promise<IdentifySpeakersResult> {
+    const { backendUrl } = useSettingsStore.getState();
+    let baseUrl = backendUrl.replace(/\/$/, "");
+    if (!baseUrl.endsWith("/api/v1")) baseUrl = `${baseUrl}/api/v1`;
+    const url = `${baseUrl}/identify-speakers`;
+
+    const response = await fetch(url, {
+        method: "POST",
+        headers: {
+            "Content-Type": "application/json",
+            "Authorization": `Bearer ${token}`,
+        },
+        body: JSON.stringify({ turns, participant_hints: participantHints }),
+    });
+
+    if (!response.ok) {
+        const errText = await response.text();
+        let detail = errText;
+        try { const p = JSON.parse(errText); if (p.detail) detail = p.detail; } catch { }
+        if (response.status === 401) throw new Error(`Unauthorized: ${detail}`);
+        if (response.status === 402) throw new Error(`Payment Required: ${detail}`);
+        if (response.status === 413) throw new Error(`För stort: ${detail}`);
+        throw new Error(`Talaridentifiering misslyckades: ${detail}`);
+    }
+
+    return await response.json();
+}

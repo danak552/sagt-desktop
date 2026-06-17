@@ -4,7 +4,7 @@
 
 [Download for Windows →](https://downloads.sagt.ai/Sagt.ai-setup.exe) | [sagt.ai](https://sagt.ai)
 
-**Current version: v0.9.31** — the in-app updater is now fully visible: a single toast shows download progress (percent and MB), an "Installing — restarting automatically" notice, and a retry button on network errors. Updating is blocked while a recording is in progress, so the installer can never cut a recording short.
+**Current version: v0.9.32** — speaker identification: name the people in a recording, label transcript turns by speaker, and let the app suggest names from the conversation (Pro). Plus a faster, more robust startup — the app no longer hangs on a blank screen while the backend wakes from cold start, and falls back gracefully when offline.
 
 ![Sagt.ai Desktop — real-time Swedish transcription](assets/screenshot.png)
 
