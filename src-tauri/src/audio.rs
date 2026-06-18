@@ -1638,8 +1638,11 @@ fn start_session_recorder(
         }
 
         // 2. Recording Start
+        // Stereo: L=mic (DU), R=sys (MÖTET). Bevarar talarkanalerna i sessions-WAV:en
+        // så batch-omtranskribering + webb kan återskapa Du/Mötet (Fas 1b). Live-whispern
+        // rör inte denna fil (egna per-kanal-VAD-chunks) → live-vägen är oberörd.
         let spec = hound::WavSpec {
-            channels: 1,
+            channels: 2,
             sample_rate: SAMPLE_RATE,
             bits_per_sample: 16,
             sample_format: hound::SampleFormat::Int,
@@ -1686,34 +1689,42 @@ fn start_session_recorder(
              
              while !mic_buffer.is_empty() || !sys_buffer.is_empty() {
                  let amplitude = i16::MAX as f32;
-                 let mixed_f32: f32;
+                 let left_f32: f32;   // mic → vänsterkanal (DU)
+                 let right_f32: f32;  // sys → högerkanal (MÖTET)
 
                  if !mic_buffer.is_empty() && !sys_buffer.is_empty() {
                      let mut m = mic_buffer.pop_front().unwrap();
                      let mut s = sys_buffer.pop_front().unwrap();
                      if m.is_nan() || m.is_infinite() { m = 0.0; }
                      if s.is_nan() || s.is_infinite() { s = 0.0; }
-                     mixed_f32 = (m + s).clamp(-1.0, 1.0);
+                     left_f32 = m;
+                     right_f32 = s;
                  }
                  else if !mic_buffer.is_empty() {
                       if mic_buffer.len() > 8000 {
                            let mut m = mic_buffer.pop_front().unwrap();
                            if m.is_nan() || m.is_infinite() { m = 0.0; }
-                           mixed_f32 = m;
+                           left_f32 = m;
+                           right_f32 = 0.0;
                       } else { break; }
                  }
                  else { // only sys
                       if sys_buffer.len() > 8000 {
                            let mut s = sys_buffer.pop_front().unwrap();
                            if s.is_nan() || s.is_infinite() { s = 0.0; }
-                           mixed_f32 = s;
+                           left_f32 = 0.0;
+                           right_f32 = s;
                       } else { break; }
                  }
 
+                 // Cloud-merged-VAD körs fortfarande på den summerade mixen (oförändrat).
                  if merged_cloud {
+                     let mixed_f32 = (left_f32 + right_f32).clamp(-1.0, 1.0);
                      merged_vad.push(mixed_f32, vad_threshold, vad_silence_ms, &app);
                  }
-                 writer.write_sample((mixed_f32 * amplitude) as i16).unwrap();
+                 // Stereo: skriv L (mic/DU) sedan R (sys/MÖTET) — hound interleavar i anropsordning.
+                 writer.write_sample((left_f32 * amplitude) as i16).unwrap();
+                 writer.write_sample((right_f32 * amplitude) as i16).unwrap();
              }
         }
         
@@ -1732,25 +1743,28 @@ fn start_session_recorder(
         {
             let amplitude = i16::MAX as f32;
             while !mic_buffer.is_empty() || !sys_buffer.is_empty() {
-                let mixed_f32 = if !mic_buffer.is_empty() && !sys_buffer.is_empty() {
+                let (left_f32, right_f32) = if !mic_buffer.is_empty() && !sys_buffer.is_empty() {
                     let mut m = mic_buffer.pop_front().unwrap();
                     let mut s = sys_buffer.pop_front().unwrap();
                     if m.is_nan() || m.is_infinite() { m = 0.0; }
                     if s.is_nan() || s.is_infinite() { s = 0.0; }
-                    (m + s).clamp(-1.0, 1.0)
+                    (m, s)
                 } else if !mic_buffer.is_empty() {
                     let mut m = mic_buffer.pop_front().unwrap();
                     if m.is_nan() || m.is_infinite() { m = 0.0; }
-                    m
+                    (m, 0.0)
                 } else {
                     let mut s = sys_buffer.pop_front().unwrap();
                     if s.is_nan() || s.is_infinite() { s = 0.0; }
-                    s
+                    (0.0, s)
                 };
                 if merged_cloud {
+                    let mixed_f32 = (left_f32 + right_f32).clamp(-1.0, 1.0);
                     merged_vad.push(mixed_f32, vad_threshold, vad_silence_ms, &app);
                 }
-                if writer.write_sample((mixed_f32 * amplitude) as i16).is_err() { break; }
+                // Stereo: L (mic/DU) sedan R (sys/MÖTET).
+                if writer.write_sample((left_f32 * amplitude) as i16).is_err() { break; }
+                if writer.write_sample((right_f32 * amplitude) as i16).is_err() { break; }
             }
         }
 
@@ -1759,10 +1773,12 @@ fn start_session_recorder(
             merged_vad.flush(&app);
         }
 
-        // Pad 500ms silence (8000 samples @ 16kHz) — Whisper cuts the final word
+        // Pad 500ms silence (8000 frames @ 16kHz) — Whisper cuts the final word
         // when audio ends abruptly without trailing silence after the last utterance.
+        // Stereo: 2 sampel/frame (L+R).
         for _ in 0..(SAMPLE_RATE / 2) {
-            let _ = writer.write_sample(0i16);
+            let _ = writer.write_sample(0i16); // L
+            let _ = writer.write_sample(0i16); // R
         }
         println!("DEBUG: Session recorder flushed buffers and added silence pad.");
 
@@ -1783,10 +1799,11 @@ fn start_session_recorder(
             // But we know samples written... 
             // Let's use metadata?
             if let Ok(meta) = std::fs::metadata(&filename) {
-                // Header (44) + samples * 2
+                // Header (44) + frames * 4 (stereo: 2 kanaler × 2 byte/sampel).
+                // OBS: /4.0 (inte /2.0) — annars halveras varaktigheten för stereo-WAV.
                 let bytes = meta.len();
                 if bytes > 44 {
-                    state.duration_sec = (bytes - 44) as f64 / 2.0 / SAMPLE_RATE as f64;
+                    state.duration_sec = (bytes - 44) as f64 / 4.0 / SAMPLE_RATE as f64;
                 }
             }
         }
@@ -1851,6 +1868,7 @@ fn try_save_session(app: &AppHandle, session_state: &Arc<Mutex<SessionState>>) {
                 analysis_json: None,
                 ai_template_used: None,
                 cloud_transcript: None,
+                cloud_segments: None,
                 sync_status: "local".to_string(),
                 audio_deleted: false,
                 speaker_map: None,

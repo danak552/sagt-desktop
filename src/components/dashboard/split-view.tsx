@@ -10,7 +10,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { useEffect, useRef, useState, useMemo } from "react";
 import { Button } from "@/components/ui/button";
 import { getJob, reanalyzeTranscript, reanalyzeJob, uploadJob, identifySpeakers, SpeakerTurn } from "@/lib/api";
-import { applyInlineCloudResult } from "@/lib/cloud-sync";
+import { applyInlineCloudResult, cloudSegmentsJsonFromJob } from "@/lib/cloud-sync";
 import { AnalysisData } from "@/store/sync-store";
 import { useAuthStore } from "@/store/auth-store";
 import { toast } from "sonner";
@@ -80,34 +80,66 @@ export function SplitView() {
     // över varandra — användaren växlar vy och ser skillnaden mellan modellerna.
     const [transcriptView, setTranscriptView] = useState<'local' | 'cloud'>('local');
     const cloudTranscript: string | null = activeJob?.cloud_transcript?.trim() || null;
-    const hasModelToggle = !!cloudTranscript && rawSegments.length > 0;
+
+    // Fas 1c: strukturerade molnsegment (DU/MÖTET-turer från stereo-omtranskribering).
+    // När de finns renderar molnvyn äkta turer i stället för den flata textblobben — och
+    // Fas 1:s namnsättning ("Identifiera talare") fungerar då även på molnresultatet.
+    // Faller tillbaka till flat blob (cloud_transcript) för mono/gamla inspelningar.
+    const cloudStructured = useMemo((): UISegment[] => {
+        const raw: string | undefined = activeJob?.cloud_segments;
+        if (!raw) return [];
+        try {
+            const parsed = JSON.parse(raw);
+            if (!Array.isArray(parsed)) return [];
+            return parsed
+                .filter((s: any) => String(s?.text ?? "").trim())
+                .map((s: any, i: number) => ({
+                    id: -(i + 1),
+                    start_time: s.start_time ?? 0,
+                    end_time: s.end_time ?? 0,
+                    text: String(s.text).trim(),
+                    speaker: s.speaker || "MÖTET",
+                    timestamp: 0,
+                }));
+        } catch {
+            return [];
+        }
+    }, [activeJob?.cloud_segments]);
+
+    const hasCloudResult = !!cloudTranscript || cloudStructured.length > 0;
+    const hasModelToggle = hasCloudResult && rawSegments.length > 0;
 
     // Derive displayed segments synchronously so the first render after a tab switch
     // already shows the cloud result — no flash of stale local segments.
     const segments = useMemo((): UISegment[] => {
-        const cloudSeg = (): UISegment[] => [{
-            id: -1,
-            start_time: 0,
-            end_time: 0,
-            text: cloudTranscript!,
-            speaker: "MOLN" as const,
-            timestamp: 0,
-        }];
+        // Molnvyn: strukturerade turer om de finns, annars flat MOLN-blob (gamla/mono).
+        const cloudSeg = (): UISegment[] => {
+            if (cloudStructured.length > 0) return cloudStructured;
+            if (cloudTranscript) return [{
+                id: -1,
+                start_time: 0,
+                end_time: 0,
+                text: cloudTranscript,
+                speaker: "MOLN" as const,
+                timestamp: 0,
+            }];
+            return [];
+        };
         if (hasModelToggle && transcriptView === 'cloud') return cloudSeg();
         if (rawSegments.length > 0) {
             // Molnchunks kan slutföras i annan ordning än de talades — sortera på start_time.
             return [...rawSegments].sort((a, b) => (a.start_time || 0) - (b.start_time || 0));
         }
-        if (cloudTranscript) return cloudSeg();
+        if (hasCloudResult) return cloudSeg();
         return [];
-    }, [cloudTranscript, hasModelToggle, transcriptView, rawSegments]);
+    }, [cloudTranscript, cloudStructured, hasCloudResult, hasModelToggle, transcriptView, rawSegments]);
 
     // Visa molnresultatet som standard när det finns (bästa modellen) — både vid
     // återöppning från historiken och när en omtranskribering/auto-synk blir klar.
-    // Manuell växling påverkas inte (deps ändras bara när cloud_transcript byts).
+    // Manuell växling påverkas inte (deps ändras bara när molnresultatet byts).
     useEffect(() => {
-        setTranscriptView(activeJob?.cloud_transcript ? 'cloud' : 'local');
-    }, [activeJob?.id, activeJob?.cloud_transcript]);
+        setTranscriptView((activeJob?.cloud_transcript || activeJob?.cloud_segments) ? 'cloud' : 'local');
+    }, [activeJob?.id, activeJob?.cloud_transcript, activeJob?.cloud_segments]);
 
     // Sammanhängande-läge: alla segment är "MOLN" → rendera som ETT flöde med styckesbryt
     // vid pauser (gap mellan segment ≥ pauseBreakMs). Pausbryt härleds ur Rusts VAD-timing.
@@ -594,7 +626,7 @@ export function SplitView() {
             clearSegments();
         }
         // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, [activeJob?.id, activeJob?.cloud_transcript, setSegments, clearSegments]);
+    }, [activeJob?.id, activeJob?.cloud_transcript, activeJob?.cloud_segments, setSegments, clearSegments]);
 
     const formatDuration = (seconds: number) => {
         const h = Math.floor(seconds / 3600);
@@ -658,6 +690,9 @@ export function SplitView() {
 
                     // Replace local whisper segments with the superior Berget cloud transcription
                     const cloudText = job.result?.text;
+                    // Fas 1c: strukturerade DU/MÖTET-turer (stereo) → molnvyn renderar turer i
+                    // stället för flat blob. Null för mono (inga talare) → flat blob behålls.
+                    const cloudSegmentsJson = cloudSegmentsJsonFromJob(job);
                     if (cloudText) {
                         const wordCount = cloudText.trim().split(/\s+/).filter(Boolean).length;
                         events.cloudSyncCompleted(wordCount);
@@ -666,9 +701,11 @@ export function SplitView() {
                     setUploadedJobId(null);
                     if (cloudText && cloudText.trim()) {
                         // Skriv ALDRIG över lokala/diariserade segment — molnresultatet visas
-                        // via modellväxlaren (activeJob.cloud_transcript). Endast när inget
-                        // annat resultat finns sätts det direkt som segment (batch-only).
-                        if (useTranscriptionStore.getState().segments.length === 0) {
+                        // via modellväxlaren (activeJob.cloud_transcript/cloud_segments). Endast när
+                        // inget annat resultat finns OCH molnet saknar strukturerade turer sätts den
+                        // flata blobben direkt (batch-only); med turer renderar molnvyn dem via
+                        // activeJob.cloud_segments (ingen falsk "lokal"-flik med samma text).
+                        if (useTranscriptionStore.getState().segments.length === 0 && !cloudSegmentsJson) {
                             setSegments([{
                                 id: -1,
                                 start_time: 0,
@@ -698,12 +735,21 @@ export function SplitView() {
                                     transcript: cloudText.trim(),
                                 });
                             }
+                            // Skriv ALLTID cloud_segments (tom sträng = rensa) så DB och
+                            // in-memory aldrig divergerar — annars skulle en stereo→mono-
+                            // omtranskribering lämna kvar gamla turer i DB medan activeJob
+                            // nollställs → stale turer vid återöppning.
+                            await invoke("save_cloud_segments_to_db", {
+                                id: currentActiveJob.id,
+                                cloudSegments: cloudSegmentsJson || "",
+                            });
 
-                            // Persist cloud_transcript so segments survive tab switches
+                            // Persist cloud_transcript + cloud_segments so segments survive tab switches
                             const updatedJob = {
                                 ...currentActiveJob,
                                 analysis_json: JSON.stringify(completedAnalysis),
                                 cloud_transcript: cloudText || null,
+                                cloud_segments: cloudSegmentsJson,
                             };
                             setActiveJob(updatedJob);
                         } catch (e) {

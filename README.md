@@ -4,7 +4,7 @@
 
 [Download for Windows →](https://downloads.sagt.ai/Sagt.ai-setup.exe) | [sagt.ai](https://sagt.ai)
 
-**Current version: v0.9.32** — speaker identification: name the people in a recording, label transcript turns by speaker, and let the app suggest names from the conversation (Pro). Plus a faster, more robust startup — the app no longer hangs on a blank screen while the backend wakes from cold start, and falls back gracefully when offline.
+**Current version: v0.9.33** — true turn-by-turn "who said what": each side of a meeting is now split into individual utterances and interleaved on the timeline, so re-transcribed recordings read as a real back-and-forth conversation (You / The meeting) instead of two channel-long blocks. Builds on v0.9.32's speaker identification — naming the people in a recording and suggesting names from the conversation (Pro).
 
 ![Sagt.ai Desktop — real-time Swedish transcription](assets/screenshot.png)
 

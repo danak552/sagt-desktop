@@ -19,6 +19,12 @@ pub struct Recording {
     /// KB-Whisper Large-resultat (moln). Lagras separat från de lokala segmenten så
     /// användaren kan växla mellan modellernas resultat för samma inspelning.
     pub cloud_transcript: Option<String>,
+    /// Strukturerade molnsegment (Fas 1c) — JSON `[{start_time,end_time,text,speaker}]` med
+    /// DU/MÖTET-turer från stereo-omtranskribering. Lagras separat från `cloud_transcript`
+    /// (flat text = modellväxlarens fallback) så molnvyn kan rendera turer i stället för en
+    /// textblob. serde(default) — `save_recording_to_db` skickar inte fältet vid första sparningen.
+    #[serde(default)]
+    pub cloud_segments: Option<String>,
     /// Talaridentifiering (Fas 1) — JSON `{ "map": {etikett→namn}, "participants": [...] }`.
     /// Icke-förstörande: segmenten lämnas orörda, UI:t applicerar namnen ovanpå Du/Mötet.
     /// serde(default) — `save_recording_to_db` skickar inte fältet vid första sparningen.
@@ -183,6 +189,17 @@ impl DatabaseManager {
             let _ = conn.execute("ALTER TABLE recordings ADD COLUMN speaker_map TEXT", []);
         }
 
+        // Migration: cloud_segments — strukturerade molnsegment (DU/MÖTET-turer, Fas 1c)
+        let cloud_segments_col_exists: bool = conn.query_row(
+            "SELECT count(*) FROM pragma_table_info('recordings') WHERE name='cloud_segments'",
+            [],
+            |row| row.get(0),
+        ).unwrap_or(0) > 0;
+
+        if !cloud_segments_col_exists {
+            let _ = conn.execute("ALTER TABLE recordings ADD COLUMN cloud_segments TEXT", []);
+        }
+
         Ok(())
     }
 
@@ -215,8 +232,8 @@ impl DatabaseManager {
 
         // 2. Insert Recording
         tx.execute(
-            "INSERT INTO recordings (filename, file_path, duration_sec, created_at, sync_status, cloud_job_id, analysis_json, ai_template_used, cloud_transcript, audio_deleted, speaker_map)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            "INSERT INTO recordings (filename, file_path, duration_sec, created_at, sync_status, cloud_job_id, analysis_json, ai_template_used, cloud_transcript, audio_deleted, speaker_map, cloud_segments)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             params![
                 recording.filename,
                 recording.file_path,
@@ -228,7 +245,8 @@ impl DatabaseManager {
                 recording.ai_template_used,
                 recording.cloud_transcript,
                 recording.audio_deleted,
-                recording.speaker_map
+                recording.speaker_map,
+                recording.cloud_segments
             ],
         ).map_err(|e| e.to_string())?;
 
@@ -259,7 +277,7 @@ impl DatabaseManager {
 
     pub fn get_all_recordings(&self) -> Result<Vec<Recording>, String> {
         let conn = self.get_connection().map_err(|e| e.to_string())?;
-        let mut stmt = conn.prepare("SELECT id, filename, file_path, duration_sec, created_at, sync_status, cloud_job_id, analysis_json, ai_template_used, cloud_transcript, audio_deleted, speaker_map, EXISTS(SELECT 1 FROM segments WHERE segments.recording_id = recordings.id) FROM recordings ORDER BY created_at DESC").map_err(|e| e.to_string())?;
+        let mut stmt = conn.prepare("SELECT id, filename, file_path, duration_sec, created_at, sync_status, cloud_job_id, analysis_json, ai_template_used, cloud_transcript, audio_deleted, speaker_map, cloud_segments, EXISTS(SELECT 1 FROM segments WHERE segments.recording_id = recordings.id) FROM recordings ORDER BY created_at DESC").map_err(|e| e.to_string())?;
 
         let recordings_iter = stmt.query_map([], |row| {
             Ok(Recording {
@@ -275,7 +293,8 @@ impl DatabaseManager {
                 cloud_transcript: row.get(9)?,
                 audio_deleted: row.get(10)?,
                 speaker_map: row.get(11)?,
-                has_segments: row.get(12)?,
+                cloud_segments: row.get(12)?,
+                has_segments: row.get(13)?,
             })
         }).map_err(|e| e.to_string())?;
 
@@ -388,6 +407,20 @@ impl DatabaseManager {
         conn.execute(
             "UPDATE recordings SET cloud_transcript = ?1 WHERE id = ?2",
             params![transcript, id]
+        ).map_err(|e| e.to_string())?;
+
+        Ok(())
+    }
+
+    /// Persistera strukturerade molnsegment (DU/MÖTET-turer från stereo-omtranskribering)
+    /// som JSON. Lokala segment + `cloud_transcript` lämnas orörda — molnvyn renderar
+    /// dessa turer i stället för den flata textblobben (Fas 1c).
+    pub fn save_cloud_segments(&self, id: i64, cloud_segments: String) -> Result<(), String> {
+        let conn = self.get_connection().map_err(|e| e.to_string())?;
+
+        conn.execute(
+            "UPDATE recordings SET cloud_segments = ?1 WHERE id = ?2",
+            params![cloud_segments, id]
         ).map_err(|e| e.to_string())?;
 
         Ok(())
