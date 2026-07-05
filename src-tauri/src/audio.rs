@@ -286,15 +286,17 @@ impl AudioMonitor {
 
              // Enhetspolling var 2 s: rebind av loopbacken vid default-utgångsbyte.
              let mut last_device_poll = Instant::now();
+             // Senast den BUNDNA loopbacken levererade hörbart ljud. MEDVETET inte i
+             // RecordingState trots att start-kanten nollar den: muteras av level-
+             // handlern och av loopback-rebinden (fräsch tystnadsfrist) även utanför
+             // inspelning, och metersvepets tystnadsgrind läser den i kantfönstret
+             // mellan is_recording=true och 2s-pollens start-kantdetektering.
+             let mut last_sys_audible = Instant::now();
              // Guardrail: engångsvarning per inspelning när inspelning pågår men inget
              // systemljud fångas — annars upptäcks tyst MÖTET-kanal först efteråt.
-             let mut last_sys_audible = Instant::now();
-             // Some(start) medan en inspelning pågår — None däremellan (edge-detektering).
-             let mut recording_since: Option<Instant> = None;
-             let mut audio_warning_sent = false;
-             // true medan en varning är synlig — släcks med audio-warning-cleared när
-             // systemljud börjar flöda igen (t.ex. efter lyckad follow-the-audio-switch).
-             let mut audio_warning_active = false;
+             // Some medan en inspelning pågår — None däremellan; kanterna detekteras
+             // i 2s-pollen. Se RecordingState för fältens invarianter.
+             let mut rec_state: Option<RecordingState> = None;
              // Engångstoast per mic-felepisod (nollställs vid lyckad rebind) —
              // fail-loud utan att spamma en toast var 2 s medan enheten saknas.
              let mut mic_error_emitted = false;
@@ -308,24 +310,11 @@ impl AudioMonitor {
              // loopbacken från default.
              let mut last_meter_poll = Instant::now();
              // (kandidatnamn, antal på varandra följande svep) — dämpar byten så att en
-             // enstaka ljudspik på fel endpoint inte rycker loopbacken.
+             // enstaka ljudspik på fel endpoint inte rycker loopbacken. MEDVETET inte
+             // i RecordingState: streaken ägs av svepgrinden (självnollande utanför
+             // inspelning via else-grenen) och en streak byggd i kantfönstret före
+             // start-kantdetekteringen ska överleva in i inspelningen.
              let mut candidate_streak: Option<(String, u32)> = None;
-             // Senaste svep där NÅGON render-endpoint var hörbar. Gate för tystnads-
-             // varningen: låter det ingenstans (ren diktering utan uppspelning) finns
-             // inget att fånga och ingen varning att ge.
-             // INVARIANT som gör timestampen färsk när den behövs: svep-grinden öppnar
-             // vid 2 s bunden tystnad och varningströskeln ligger på 5 s — svepet har
-             // alltså hunnit köra ≥ 3 gånger innan varningsvillkoret läser värdet.
-             // Sänk aldrig 5s-tröskeln under svep-grindens 2 s + en svepperiod.
-             let mut last_any_endpoint_audible: Option<Instant> = None;
-             // Cooldown mellan tystnadsvarningar. Re-arm-flödet (ljud → cleared → ny
-             // tystnad → ny varning) får inte flimra bannern var 5:e sekund i fall där
-             // ljudet hoppar mellan endpoints snabbare än follow-the-audio hinner pinna.
-             let mut last_warning_fired: Option<Instant> = None;
-             // Har MÖTET-kanalen levererat något ljud alls under pågående inspelning?
-             // false + hörbar annan endpoint = snabbspåret (Teams på kommunikations-
-             // enheten medan loopbacken lyssnar på console-defaulten).
-             let mut sys_had_audio_this_recording = false;
              // Beordra rebind direkt vid nästa 2s-poll efter ett target-byte.
              let mut force_sys_rebind = false;
              // Endpoint vars pinned-bind nyss misslyckades (t.ex. HFP-endpoint som
@@ -349,15 +338,12 @@ impl AudioMonitor {
                                 // ljud (lågt uppspelningsvolym).
                                 if v > 0.0 {
                                     last_sys_audible = Instant::now();
-                                    sys_had_audio_this_recording = true;
                                     // Systemljud flödar igen — släck en aktiv varning och
-                                    // ÅTERAKTIVERA den: blir det tyst ≥ 5 s igen ska en ny
-                                    // varning fyra. Utan re-arm skulle en enda ljudblipp
-                                    // avväpna guardrailen för resten av inspelningen.
-                                    if audio_warning_active {
-                                        audio_warning_active = false;
-                                        audio_warning_sent = false;
-                                        let _ = app_handle_main.emit("audio-warning-cleared", ());
+                                    // åter-arma den (se RecordingState::on_sys_audio).
+                                    if let Some(rec) = rec_state.as_mut() {
+                                        if rec.on_sys_audio() {
+                                            let _ = app_handle_main.emit("audio-warning-cleared", ());
+                                        }
                                     }
                                 }
                             },
@@ -404,7 +390,13 @@ impl AudioMonitor {
                     {
                         let levels = crate::audio_meter::render_endpoint_levels();
                         if levels.iter().any(|l| l.peak > 0.001) {
-                            last_any_endpoint_audible = Some(Instant::now());
+                            // Gatead på rec_state utan beteendeskillnad: utanför inspelning
+                            // läses fältet aldrig, och i kantfönstret raderade start-kantens
+                            // nollställning ändå värdet innan första läsningen. LASTBÄRANDE-
+                            // invarianten (None-init + 5s-tröskel) bor i note_endpoint_audible.
+                            if let Some(rec) = rec_state.as_mut() {
+                                rec.note_endpoint_audible();
+                            }
                         }
                         let bound_name = sys_capture.as_ref().map(|c| c.device_name.clone());
                         let quarantined = pinned_quarantine.as_ref().and_then(|(name, at)| {
@@ -428,8 +420,8 @@ impl AudioMonitor {
                                 // fel endpoint får aldrig rycka loopbacken. Snabbspåret
                                 // (MÖTET har inte levererat något alls denna inspelning)
                                 // slipper bara 4s-tystnadskravet, inte dämpningen.
-                                let fast_path = recording_since.is_some()
-                                    && !sys_had_audio_this_recording;
+                                let fast_path = rec_state.as_ref()
+                                    .is_some_and(|r| !r.sys_had_audio);
                                 let slow_path = bound_silent_for >= Duration::from_secs(4);
                                 if streak >= 2 && (fast_path || slow_path) {
                                     println!(
@@ -518,7 +510,7 @@ impl AudioMonitor {
                     // INVARIANT: pinned utan pågående inspelning är alltid fel state —
                     // pinnen hör till inspelningen den skapades i. Städas här varje poll
                     // (inte bara på stopp-kanten) så att även en blixtsnabb start+stopp
-                    // som aldrig hann sätta recording_since inte lämnar en kvarlämnad pin
+                    // som aldrig hann skapa RecordingState inte lämnar en kvarlämnad pin
                     // som kapar nästa sessions MÖTET-kanal. Placeringen före exists-
                     // kontrollen gör också att idle-appen aldrig COM-enumererar för en
                     // pin som ändå ska släppas.
@@ -594,38 +586,35 @@ impl AudioMonitor {
                     // förlorad replik dyr, och follow-the-audio-switchen har redan
                     // hunnit försöka innan varningen fyrar.
                     if recording_now {
-                        if recording_since.is_none() {
-                            recording_since = Some(Instant::now());
+                        if rec_state.is_none() {
+                            // Start-kant: färskt per-inspelnings-state (RecordingState::new).
+                            let mut rec = RecordingState::new();
+                            // LOCKSTEP med new(): fältet lever utanför structen (se decl —
+                            // muteras även utanför inspelning) men denna reset är lastbärande
+                            // per inspelning. Utan den läser tystnadsvarningen en stale
+                            // timestamp från idle-perioden före start — som antingen fyrar
+                            // falskt eller undertrycker en äkta varning. Ingen kod får
+                            // hamna mellan new() och den här raden.
                             last_sys_audible = Instant::now();
-                            audio_warning_sent = false;
-                            audio_warning_active = false;
-                            sys_had_audio_this_recording = false;
-                            // Färsk inspelning = färskt varningsstate — en timestamp från
-                            // förra sessionen får varken öppna eller blockera varningen.
-                            last_any_endpoint_audible = None;
-                            last_warning_fired = None;
                             // Pre-flight: startar inspelningen helt utan loopback finns
                             // inget att vänta på — varna omedelbart.
                             if sys_capture.is_none() {
-                                audio_warning_sent = true;
-                                audio_warning_active = true;
-                                let _ = app_handle_main.emit(
-                                    "audio-warning",
-                                    "Systemljud är inte tillgängligt — mötesljud (MÖTET) spelas inte in",
-                                );
+                                let _ = app_handle_main
+                                    .emit("audio-warning", rec.fire_preflight_warning());
                             }
+                            rec_state = Some(rec);
                         }
                     } else {
-                        // Stopp-kant: släck banner som hör till inspelningen. Unpin sköts
-                        // av invarianten före pinned-kontrollen ovan (körs varje poll utan
-                        // inspelning). candidate_streak nollas av metersvepets else-gren
-                        // när inspelning inte pågår; last_any_endpoint_audible nollas på
-                        // start-kanten — stopp-kanten äger bara bannern.
-                        if recording_since.is_some() && audio_warning_active {
-                            let _ = app_handle_main.emit("audio-warning-cleared", ());
+                        // Stopp-kant: släck banner som hör till inspelningen — droppen av
+                        // RecordingState ÄR nollställningen av övrigt per-inspelnings-state.
+                        // Unpin sköts av invarianten före pinned-kontrollen ovan (körs varje
+                        // poll utan inspelning). candidate_streak nollas av metersvepets
+                        // else-gren när inspelning inte pågår.
+                        if let Some(rec) = rec_state.take() {
+                            if rec.banner_visible() {
+                                let _ = app_handle_main.emit("audio-warning-cleared", ());
+                            }
                         }
-                        recording_since = None;
-                        audio_warning_active = false;
                     }
 
                     // Tystnadsgrenen kräver att NÅGON endpoint varit hörbar nyligen:
@@ -633,23 +622,15 @@ impl AudioMonitor {
                     // Ren diktering utan uppspelning är äkta tystnad — inget falsklarm.
                     // Saknad loopback varnar däremot ovillkorligt (urdragen utgång ska
                     // ge banner även om inget råkar spelas just då).
-                    if let Some(started) = recording_since {
-                        if !audio_warning_sent
-                            && started.elapsed() >= Duration::from_secs(5)
-                            && last_warning_fired
-                                .map_or(true, |t| t.elapsed() >= Duration::from_secs(20))
+                    if let Some(rec) = rec_state.as_mut() {
+                        if rec.silence_warning_ready()
                             && (sys_capture.is_none()
                                 || (last_sys_audible.elapsed() >= Duration::from_secs(5)
-                                    && last_any_endpoint_audible
+                                    && rec.last_any_endpoint_audible
                                         .is_some_and(|t| t.elapsed() < Duration::from_secs(5))))
                         {
-                            audio_warning_sent = true;
-                            audio_warning_active = true;
-                            last_warning_fired = Some(Instant::now());
-                            let _ = app_handle_main.emit(
-                                "audio-warning",
-                                "Systemljud fångas inte — kontrollera ljudutgången",
-                            );
+                            let _ = app_handle_main
+                                .emit("audio-warning", rec.fire_silence_warning());
                         }
                     }
                 }
@@ -828,6 +809,116 @@ fn find_output_device(host: &cpal::Host, name: &str) -> Option<cpal::Device> {
 enum SysTarget {
     Default,
     Pinned(String),
+}
+
+/// Tystnadsvarningens läge under en inspelning. Ersätter bool-paret
+/// audio_warning_sent/audio_warning_active: inom en inspelning var bara
+/// kombinationerna false/false och true/true nåbara, så lägena är exakt två.
+enum WarningState {
+    /// Ingen banner synlig — varningen får fyra när villkoren uppfylls. Både
+    /// startläget och läget efter re-arm (systemljud flödade igen).
+    Armed,
+    /// Banner synlig — släcks och åter-armas via on_sys_audio när ljud flödar igen.
+    Warned,
+}
+
+/// Per-inspelnings-state för guardrail-varningen "audio-warning" (inspelning pågår
+/// men inget systemljud fångas). Skapas på 2s-pollens start-kant och droppas på
+/// stopp-kanten — "en gång per inspelning" är därmed struct-livstiden, inte en
+/// nollställningslista som måste hållas i synk på flera ställen.
+struct RecordingState {
+    /// När start-kanten detekterades — varningströskeln (≥ 5 s) mäts härifrån.
+    started: Instant,
+    warning: WarningState,
+    /// Cooldown mellan tystnadsvarningar. Re-arm-flödet (ljud → cleared → ny
+    /// tystnad → ny varning) får inte flimra bannern var 5:e sekund i fall där
+    /// ljudet hoppar mellan endpoints snabbare än follow-the-audio hinner pinna.
+    /// Sätts BARA av tystnadsvarningen — pre-flight-varningen rör den inte.
+    last_warning_fired: Option<Instant>,
+    /// Har MÖTET-kanalen levererat något ljud alls under inspelningen?
+    /// false + hörbar annan endpoint = snabbspåret (Teams på kommunikations-
+    /// enheten medan loopbacken lyssnar på console-defaulten).
+    sys_had_audio: bool,
+    /// Senaste svep där NÅGON render-endpoint var hörbar. Gate för tystnads-
+    /// varningen: låter det ingenstans (ren diktering utan uppspelning) finns
+    /// inget att fånga och ingen varning att ge.
+    /// INVARIANT som gör timestampen färsk när den behövs: svep-grinden öppnar
+    /// vid 2 s bunden tystnad och varningströskeln ligger på 5 s — svepet har
+    /// alltså hunnit köra ≥ 3 gånger innan varningsvillkoret läser värdet.
+    /// Sänk aldrig 5s-tröskeln under svep-grindens 2 s + en svepperiod.
+    last_any_endpoint_audible: Option<Instant>,
+}
+
+impl RecordingState {
+    /// Start-kanten: färsk inspelning = färskt varningsstate — en timestamp från
+    /// förra sessionen får varken öppna eller blockera varningen.
+    fn new() -> Self {
+        Self {
+            started: Instant::now(),
+            warning: WarningState::Armed,
+            last_warning_fired: None,
+            sys_had_audio: false,
+            last_any_endpoint_audible: None,
+        }
+    }
+
+    /// Systemljud flödar igen: släck en synlig banner och ÅTERAKTIVERA varningen —
+    /// blir det tyst ≥ 5 s igen ska en ny varning fyra. Utan re-arm skulle en enda
+    /// ljudblipp avväpna guardrailen för resten av inspelningen. Cooldownen
+    /// (last_warning_fired) behålls avsiktligt över re-arm. Returnerar true när
+    /// "audio-warning-cleared" ska emittas.
+    fn on_sys_audio(&mut self) -> bool {
+        self.sys_had_audio = true;
+        match self.warning {
+            WarningState::Warned => {
+                self.warning = WarningState::Armed;
+                true
+            }
+            WarningState::Armed => false,
+        }
+    }
+
+    /// Metersvepet såg en hörbar render-endpoint — notera tidpunkten. Enda skrivaren
+    /// av `last_any_endpoint_audible`, så LASTBÄRANDE-invarianten (None-init i new()
+    /// + 5s-varningströskeln ⇒ ≥ 3 svep innan värdet läses) hålls hos fältets ägare
+    /// i stället för spridd på anropsplatsen. Se fältkommentaren + silence_warning_ready().
+    fn note_endpoint_audible(&mut self) {
+        self.last_any_endpoint_audible = Some(Instant::now());
+    }
+
+    /// Pre-flight på start-kanten: inspelning startad helt utan loopback — inget
+    /// att vänta på, varna omedelbart. Startar INTE 20s-cooldownen: pre-flighten
+    /// är ingen tystnadsvarning och ska inte skjuta upp en senare sådan.
+    /// Returnerar banner-texten som MÅSTE emittas som "audio-warning" — övergången
+    /// till Warned och emitten är oskiljbara, annars markeras bannern som visad
+    /// utan att användaren sett den och guardrailen avväpnas tyst.
+    fn fire_preflight_warning(&mut self) -> &'static str {
+        self.warning = WarningState::Warned;
+        "Systemljud är inte tillgängligt — mötesljud (MÖTET) spelas inte in"
+    }
+
+    /// Tystnadsvarningen fyrar: starta 20s-cooldownen. Returnerar banner-texten
+    /// som MÅSTE emittas som "audio-warning" (samma kontrakt som pre-flighten).
+    fn fire_silence_warning(&mut self) -> &'static str {
+        self.warning = WarningState::Warned;
+        self.last_warning_fired = Some(Instant::now());
+        "Systemljud fångas inte — kontrollera ljudutgången"
+    }
+
+    /// Varningens inspelningsinterna grindar: armad, ≥ 5 s in i inspelningen och
+    /// utanför 20s-cooldownen. Miljövillkoren (loopback saknas / bunden endpoint
+    /// tyst men annan hörbar) ligger kvar vid anropsplatsen i 2s-pollen.
+    fn silence_warning_ready(&self) -> bool {
+        matches!(self.warning, WarningState::Armed)
+            && self.started.elapsed() >= Duration::from_secs(5)
+            && self.last_warning_fired
+                .map_or(true, |t| t.elapsed() >= Duration::from_secs(20))
+    }
+
+    /// Stopp-kanten äger bara bannern: true = "audio-warning-cleared" ska emittas.
+    fn banner_visible(&self) -> bool {
+        matches!(self.warning, WarningState::Warned)
+    }
 }
 
 /// Aktiv WASAPI-loopback mot en specifik utgångsenhet. När strömmen droppas kopplas

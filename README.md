@@ -4,7 +4,7 @@
 
 [Download for Windows →](https://downloads.sagt.ai/Sagt.ai-setup.exe) | [sagt.ai](https://sagt.ai)
 
-**Current version: v0.9.34** — system audio now "just works" for meetings: the loopback follows the output that's actually playing, so calls routed to a headset (Teams/Zoom on a communications device) are captured instead of silently missed. Also removes the email step at first launch (recording works fully offline, no sign-in), adds a gentle Pro hint when local transcription is slow, and hardens the Windows installer. Builds on v0.9.33's turn-by-turn "who said what" transcription.
+**Current version: v0.9.35** — internal maintenance release: a code-quality refactor of the recording engine's per-recording state and a hardening of the release-signing pipeline (pinned build tooling plus a drift guard on the signature gate). No user-facing changes. Builds on v0.9.34's system-audio "just works" and offline-first improvements.
 
 ![Sagt.ai Desktop — real-time Swedish transcription](assets/screenshot.png)
 
