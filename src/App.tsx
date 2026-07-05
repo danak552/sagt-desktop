@@ -19,6 +19,7 @@ import { runStorageCleanup, getStorageUsage, formatBytes, GB, type CleanupResult
 import { useAuthStore } from "@/store/auth-store";
 import { MotdBanner } from "@/components/lifecycle/motd-banner";
 import { TrialBanner } from "@/components/lifecycle/trial-banner";
+import { AudioWarningBanner } from "@/components/lifecycle/audio-warning-banner";
 
 function App() {
   useConnectivity();
@@ -96,14 +97,25 @@ function App() {
     return () => { unlistenPromise.then((f) => f()); };
   }, []);
 
-  // Guardrail från ljudmotorn: molninspelning pågår men inget systemljud fångas
-  // (t.ex. ljudutgång urdragen/inaktiverad). Engångsvarning per inspelning från Rust.
+  // Guardrail från ljudmotorn: inspelning pågår men inget systemljud fångas
+  // (t.ex. Teams på annan endpoint, ljudutgång urdragen). Engångsvarning per
+  // inspelning från Rust. Toast för uppmärksamhet + persistent banner (store) —
+  // toasten försvinner efter 10 s men problemet kvarstår tills det åtgärdats.
+  // audio-warning-cleared: systemljud flödar igen (t.ex. follow-the-audio-switch
+  // hittade rätt endpoint) → släck bannern.
   useEffect(() => {
-    const unlistenPromise = listen<string>("audio-warning", (event) => {
+    const unlistenWarning = listen<string>("audio-warning", (event) => {
       console.warn("Audio engine warning:", event.payload);
       toast.warning(event.payload, { duration: 10000 });
+      useSyncStore.getState().setAudioWarning(event.payload);
     });
-    return () => { unlistenPromise.then((f) => f()); };
+    const unlistenCleared = listen("audio-warning-cleared", () => {
+      useSyncStore.getState().setAudioWarning(null);
+    });
+    return () => {
+      unlistenWarning.then((f) => f());
+      unlistenCleared.then((f) => f());
+    };
   }, []);
 
   // Hämta färsk Pro-status vid appstart och sedan var 60:e sekund.
@@ -125,6 +137,7 @@ function App() {
             <main className="flex-1 flex flex-col h-full overflow-hidden relative">
               <MotdBanner />
               <TrialBanner />
+              <AudioWarningBanner />
               <div className="flex-1 overflow-hidden relative">
                 {currentView === 'dashboard' ? <SplitView /> :
                   currentView === 'settings' ? <SettingsPage /> :

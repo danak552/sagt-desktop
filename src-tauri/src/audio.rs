@@ -273,6 +273,7 @@ impl AudioMonitor {
             // MÖTET-kanalen blir tyst trots att mic fungerar.
             let mut sys_capture = build_sys_capture(
                 &host, &app, &level_tx, &session_tx, &settings, &is_recording, &session_state,
+                None,
             );
 
              // --- Main Loop: Aggregating Levels & Keeping Alive ---
@@ -285,15 +286,51 @@ impl AudioMonitor {
 
              // Enhetspolling var 2 s: rebind av loopbacken vid default-utgångsbyte.
              let mut last_device_poll = Instant::now();
-             // Guardrail: engångsvarning per inspelning när molninspelning pågår men
-             // inget systemljud fångas — annars upptäcks tyst MÖTET-kanal först efteråt.
+             // Guardrail: engångsvarning per inspelning när inspelning pågår men inget
+             // systemljud fångas — annars upptäcks tyst MÖTET-kanal först efteråt.
              let mut last_sys_audible = Instant::now();
              // Some(start) medan en inspelning pågår — None däremellan (edge-detektering).
              let mut recording_since: Option<Instant> = None;
              let mut audio_warning_sent = false;
+             // true medan en varning är synlig — släcks med audio-warning-cleared när
+             // systemljud börjar flöda igen (t.ex. efter lyckad follow-the-audio-switch).
+             let mut audio_warning_active = false;
              // Engångstoast per mic-felepisod (nollställs vid lyckad rebind) —
              // fail-loud utan att spamma en toast var 2 s medan enheten saknas.
              let mut mic_error_emitted = false;
+
+             // --- Follow-the-audio-state (se SysTarget för designmotiv) ---
+             let mut sys_target = SysTarget::Default;
+             // Metersvep var 1 s — snabbare än 2s-enhetspollen eftersom Teams-fallet
+             // ska fångas inom sekunder från första distansrepliken. Svepet körs BARA
+             // under inspelning: det är då fel endpoint kostar något, och utanför
+             // inspelning ska en notisplings på en annan endpoint aldrig flytta
+             // loopbacken från default.
+             let mut last_meter_poll = Instant::now();
+             // (kandidatnamn, antal på varandra följande svep) — dämpar byten så att en
+             // enstaka ljudspik på fel endpoint inte rycker loopbacken.
+             let mut candidate_streak: Option<(String, u32)> = None;
+             // Senaste svep där NÅGON render-endpoint var hörbar. Gate för tystnads-
+             // varningen: låter det ingenstans (ren diktering utan uppspelning) finns
+             // inget att fånga och ingen varning att ge.
+             // INVARIANT som gör timestampen färsk när den behövs: svep-grinden öppnar
+             // vid 2 s bunden tystnad och varningströskeln ligger på 5 s — svepet har
+             // alltså hunnit köra ≥ 3 gånger innan varningsvillkoret läser värdet.
+             // Sänk aldrig 5s-tröskeln under svep-grindens 2 s + en svepperiod.
+             let mut last_any_endpoint_audible: Option<Instant> = None;
+             // Cooldown mellan tystnadsvarningar. Re-arm-flödet (ljud → cleared → ny
+             // tystnad → ny varning) får inte flimra bannern var 5:e sekund i fall där
+             // ljudet hoppar mellan endpoints snabbare än follow-the-audio hinner pinna.
+             let mut last_warning_fired: Option<Instant> = None;
+             // Har MÖTET-kanalen levererat något ljud alls under pågående inspelning?
+             // false + hörbar annan endpoint = snabbspåret (Teams på kommunikations-
+             // enheten medan loopbacken lyssnar på console-defaulten).
+             let mut sys_had_audio_this_recording = false;
+             // Beordra rebind direkt vid nästa 2s-poll efter ett target-byte.
+             let mut force_sys_rebind = false;
+             // Endpoint vars pinned-bind nyss misslyckades (t.ex. HFP-endpoint som
+             // vägrar loopback) — karantän så att metersvepet inte retry-loopar den.
+             let mut pinned_quarantine: Option<(String, Instant)> = None;
 
              loop {
                 if !*is_running.lock().unwrap() {
@@ -312,6 +349,16 @@ impl AudioMonitor {
                                 // ljud (lågt uppspelningsvolym).
                                 if v > 0.0 {
                                     last_sys_audible = Instant::now();
+                                    sys_had_audio_this_recording = true;
+                                    // Systemljud flödar igen — släck en aktiv varning och
+                                    // ÅTERAKTIVERA den: blir det tyst ≥ 5 s igen ska en ny
+                                    // varning fyra. Utan re-arm skulle en enda ljudblipp
+                                    // avväpna guardrailen för resten av inspelningen.
+                                    if audio_warning_active {
+                                        audio_warning_active = false;
+                                        audio_warning_sent = false;
+                                        let _ = app_handle_main.emit("audio-warning-cleared", ());
+                                    }
                                 }
                             },
                         }
@@ -336,8 +383,75 @@ impl AudioMonitor {
                     last_log = Instant::now();
                 }
 
+                // --- Follow-the-audio-metersvep (1 s) ---
+                // Läser peaknivå per render-endpoint (billigt, ingen capture-ström) och
+                // pinnar loopbacken till den endpoint som faktiskt låter när den bundna
+                // är tyst. Två vägar:
+                //   Snabbspår: inspelning pågår och MÖTET har inte levererat ett enda
+                //   sampel > 0 — klassiska Teams-fallet (samtalet på kommunikations-
+                //   enheten, loopbacken på console-defaulten) — byt så fort någon annan
+                //   endpoint låter.
+                //   Långsamt spår: bunden endpoint tyst ≥ 4 s och samma kandidat hörbar
+                //   två svep i rad — täcker byten mitt i möte utan att rycka i onödan.
+                if last_meter_poll.elapsed() >= Duration::from_secs(1) {
+                    last_meter_poll = Instant::now();
+                    let bound_silent_for = last_sys_audible.elapsed();
+                    // Svep endast under inspelning (se follow-the-audio-state ovan).
+                    // 2 s nåd efter senaste ljud/rebind — hindrar oscillation mellan två
+                    // samtidigt ljudande endpoints och ger en ny bind tid att leverera.
+                    if *is_recording.lock().unwrap()
+                        && (sys_capture.is_none() || bound_silent_for >= Duration::from_secs(2))
+                    {
+                        let levels = crate::audio_meter::render_endpoint_levels();
+                        if levels.iter().any(|l| l.peak > 0.001) {
+                            last_any_endpoint_audible = Some(Instant::now());
+                        }
+                        let bound_name = sys_capture.as_ref().map(|c| c.device_name.clone());
+                        let quarantined = pinned_quarantine.as_ref().and_then(|(name, at)| {
+                            (at.elapsed() < Duration::from_secs(30)).then(|| name.clone())
+                        });
+                        let candidate = levels
+                            .into_iter()
+                            .filter(|l| l.peak > 0.001)
+                            .filter(|l| Some(&l.name) != bound_name.as_ref())
+                            .filter(|l| Some(&l.name) != quarantined.as_ref())
+                            .max_by(|a, b| a.peak.total_cmp(&b.peak))
+                            .map(|l| l.name);
+                        match candidate {
+                            Some(name) => {
+                                let streak = match &candidate_streak {
+                                    Some((n, c)) if *n == name => c + 1,
+                                    _ => 1,
+                                };
+                                candidate_streak = Some((name.clone(), streak));
+                                // Streak ≥ 2 på BÅDA spåren — en enstaka notisplings på
+                                // fel endpoint får aldrig rycka loopbacken. Snabbspåret
+                                // (MÖTET har inte levererat något alls denna inspelning)
+                                // slipper bara 4s-tystnadskravet, inte dämpningen.
+                                let fast_path = recording_since.is_some()
+                                    && !sys_had_audio_this_recording;
+                                let slow_path = bound_silent_for >= Duration::from_secs(4);
+                                if streak >= 2 && (fast_path || slow_path) {
+                                    println!(
+                                        "DEBUG: Follow-the-audio: pinning loopback to {:?} (fast={}, streak={})",
+                                        name, fast_path, streak
+                                    );
+                                    sys_target = SysTarget::Pinned(name);
+                                    force_sys_rebind = true;
+                                    candidate_streak = None;
+                                }
+                            }
+                            None => candidate_streak = None,
+                        }
+                    } else {
+                        candidate_streak = None;
+                    }
+                }
+
                 if last_device_poll.elapsed() >= Duration::from_secs(2) {
                     last_device_poll = Instant::now();
+                    // Ett låstag per poll — läses av unpin-invarianten och guardrailen.
+                    let recording_now = *is_recording.lock().unwrap();
 
                     // --- Mic-rebind: enhetsbyte i Inställningar (desired ändrad), WASAPI-
                     // invalidering (failed-flaggan), default-mic-byte när "Standardenhet"
@@ -392,20 +506,53 @@ impl AudioMonitor {
                         }
                     }
 
-                    // Rebind när: strömmen felat (WASAPI invaliderar endpointen vid
-                    // same-name-replug), default-utgångens namn ändrats, eller när vi
-                    // saknar loopback men en utgång nu finns (gratis självläkning).
+                    // Rebind-beslut per target-läge:
+                    //   Default: som tidigare — felad ström (WASAPI invaliderar endpointen
+                    //   vid same-name-replug), default-namnbyte, eller självläkning när en
+                    //   utgång dyker upp igen.
+                    //   Pinned: felad ström eller force efter target-byte; försvinner
+                    //   endpointen ur aktiva listan → tillbaka till Default. Default-
+                    //   namnbytet ignoreras medvetet i pinned-läge — annars skulle det
+                    //   slåss mot pinnen var 2 s.
                     let default_out_name = host.default_output_device().and_then(|d| d.name().ok());
-                    let needs_rebind = match &sys_capture {
-                        Some(cap) => cap.failed.load(Ordering::SeqCst)
-                            || default_out_name.as_deref() != Some(cap.device_name.as_str()),
-                        None => default_out_name.is_some(),
+                    // INVARIANT: pinned utan pågående inspelning är alltid fel state —
+                    // pinnen hör till inspelningen den skapades i. Städas här varje poll
+                    // (inte bara på stopp-kanten) så att även en blixtsnabb start+stopp
+                    // som aldrig hann sätta recording_since inte lämnar en kvarlämnad pin
+                    // som kapar nästa sessions MÖTET-kanal. Placeringen före exists-
+                    // kontrollen gör också att idle-appen aldrig COM-enumererar för en
+                    // pin som ändå ska släppas.
+                    if !recording_now && matches!(sys_target, SysTarget::Pinned(_)) {
+                        println!("DEBUG: Not recording — unpinning loopback, reverting to default");
+                        sys_target = SysTarget::Default;
+                        force_sys_rebind = true;
+                    }
+                    if let SysTarget::Pinned(name) = &sys_target {
+                        // Meter-enumereringen i stället för cpal: output_devices() format-
+                        // probar varje endpoint och är för tungt att köra var 2 s.
+                        if !crate::audio_meter::render_endpoint_exists(name) {
+                            println!("DEBUG: Pinned endpoint {:?} disappeared — reverting to default", name);
+                            sys_target = SysTarget::Default;
+                            force_sys_rebind = true;
+                        }
+                    }
+                    let needs_rebind = force_sys_rebind || match (&sys_target, &sys_capture) {
+                        (_, Some(cap)) if cap.failed.load(Ordering::SeqCst) => true,
+                        (SysTarget::Default, Some(cap)) =>
+                            default_out_name.as_deref() != Some(cap.device_name.as_str()),
+                        (SysTarget::Default, None) => default_out_name.is_some(),
+                        (SysTarget::Pinned(_), _) => false,
                     };
                     if needs_rebind {
+                        force_sys_rebind = false;
+                        let pinned_name = match &sys_target {
+                            SysTarget::Pinned(n) => Some(n.clone()),
+                            SysTarget::Default => None,
+                        };
                         if let Some(cap) = sys_capture.take() {
                             println!(
-                                "DEBUG: Rebinding system loopback (failed={}, old={:?}, new default={:?})",
-                                cap.failed.load(Ordering::SeqCst), cap.device_name, default_out_name
+                                "DEBUG: Rebinding system loopback (failed={}, old={:?}, pinned={:?}, default={:?})",
+                                cap.failed.load(Ordering::SeqCst), cap.device_name, pinned_name, default_out_name
                             );
                             // Droppa gamla strömmen FÖRST — aldrig två aktiva loopbacks.
                             // Nedkopplad sample-kanal avslutar gamla processor-tråden,
@@ -415,32 +562,90 @@ impl AudioMonitor {
                         current_sys = 0.0;
                         sys_capture = build_sys_capture(
                             &host, &app, &level_tx, &session_tx, &settings, &is_recording, &session_state,
+                            pinned_name.as_deref(),
                         );
-                        if sys_capture.is_some() {
+                        // Pinned-bind som misslyckades eller föll tillbaka till default →
+                        // återgå till Default och sätt endpointen i karantän så att
+                        // metersvepet inte retry-loopar en endpoint som vägrar loopback
+                        // (vissa BT-HFP-endpoints gör det).
+                        if let Some(name) = pinned_name {
+                            let bound_ok = sys_capture.as_ref()
+                                .map(|c| c.device_name == name)
+                                .unwrap_or(false);
+                            if !bound_ok {
+                                println!("DEBUG: Pinned bind to {:?} failed — quarantining", name);
+                                pinned_quarantine = Some((name, Instant::now()));
+                                sys_target = SysTarget::Default;
+                            }
+                        }
+                        if let Some(cap) = &sys_capture {
                             // Ny enhet får en fräsch tystnadsfrist innan guardrail-varningen.
                             last_sys_audible = Instant::now();
+                            // Synligt för frontend/support — vilken endpoint MÖTET följer nu.
+                            let _ = app_handle_main.emit("sys-device-changed", cap.device_name.clone());
                         }
                     }
 
-                    // Guardrail "audio-warning": inspelning aktiv ≥ 10 s i molnläge utan
-                    // loopback eller utan hörbart systemljud på ≥ 10 s → varna en gång.
-                    if *is_recording.lock().unwrap() {
+                    // Guardrail "audio-warning": inspelning aktiv ≥ 5 s utan loopback
+                    // eller utan hörbart systemljud på ≥ 5 s → varna en gång per
+                    // inspelning. Gäller ALLA lägen (lokalt + moln) — betatestarens
+                    // Teams-möte kördes lokalt och det gamla molnvillkoret dolde
+                    // problemet tills efteråt. 10 s → 5 s: i möteskontext är varje
+                    // förlorad replik dyr, och follow-the-audio-switchen har redan
+                    // hunnit försöka innan varningen fyrar.
+                    if recording_now {
                         if recording_since.is_none() {
                             recording_since = Some(Instant::now());
                             last_sys_audible = Instant::now();
                             audio_warning_sent = false;
+                            audio_warning_active = false;
+                            sys_had_audio_this_recording = false;
+                            // Färsk inspelning = färskt varningsstate — en timestamp från
+                            // förra sessionen får varken öppna eller blockera varningen.
+                            last_any_endpoint_audible = None;
+                            last_warning_fired = None;
+                            // Pre-flight: startar inspelningen helt utan loopback finns
+                            // inget att vänta på — varna omedelbart.
+                            if sys_capture.is_none() {
+                                audio_warning_sent = true;
+                                audio_warning_active = true;
+                                let _ = app_handle_main.emit(
+                                    "audio-warning",
+                                    "Systemljud är inte tillgängligt — mötesljud (MÖTET) spelas inte in",
+                                );
+                            }
                         }
                     } else {
+                        // Stopp-kant: släck banner som hör till inspelningen. Unpin sköts
+                        // av invarianten före pinned-kontrollen ovan (körs varje poll utan
+                        // inspelning). candidate_streak nollas av metersvepets else-gren
+                        // när inspelning inte pågår; last_any_endpoint_audible nollas på
+                        // start-kanten — stopp-kanten äger bara bannern.
+                        if recording_since.is_some() && audio_warning_active {
+                            let _ = app_handle_main.emit("audio-warning-cleared", ());
+                        }
                         recording_since = None;
+                        audio_warning_active = false;
                     }
 
+                    // Tystnadsgrenen kräver att NÅGON endpoint varit hörbar nyligen:
+                    // varningen betyder "det låter någonstans men vi fångar det inte".
+                    // Ren diktering utan uppspelning är äkta tystnad — inget falsklarm.
+                    // Saknad loopback varnar däremot ovillkorligt (urdragen utgång ska
+                    // ge banner även om inget råkar spelas just då).
                     if let Some(started) = recording_since {
                         if !audio_warning_sent
-                            && started.elapsed() >= Duration::from_secs(10)
-                            && settings.lock().unwrap().cloud_streaming
-                            && (sys_capture.is_none() || last_sys_audible.elapsed() >= Duration::from_secs(10))
+                            && started.elapsed() >= Duration::from_secs(5)
+                            && last_warning_fired
+                                .map_or(true, |t| t.elapsed() >= Duration::from_secs(20))
+                            && (sys_capture.is_none()
+                                || (last_sys_audible.elapsed() >= Duration::from_secs(5)
+                                    && last_any_endpoint_audible
+                                        .is_some_and(|t| t.elapsed() < Duration::from_secs(5))))
                         {
                             audio_warning_sent = true;
+                            audio_warning_active = true;
+                            last_warning_fired = Some(Instant::now());
                             let _ = app_handle_main.emit(
                                 "audio-warning",
                                 "Systemljud fångas inte — kontrollera ljudutgången",
@@ -599,6 +804,32 @@ fn input_device_exists(host: &cpal::Host, name: &str) -> bool {
     find_input_device(host, name).is_some()
 }
 
+/// Hittar utgångsenheten med exakt detta namn, om den finns just nu.
+/// Namnen matchar audio_meter::render_endpoint_levels() — båda är WASAPI:s
+/// PKEY_Device_FriendlyName.
+fn find_output_device(host: &cpal::Host, name: &str) -> Option<cpal::Device> {
+    host.output_devices().ok()?
+        .find(|d| d.name().map(|n| n == name).unwrap_or(false))
+}
+
+/// Vilken render-endpoint MÖTET-loopbacken ska följa.
+///
+/// `Default` = Windows console-default (dagens beteende). `Pinned(name)` = en specifik
+/// endpoint som huvudloopens metersvep pekat ut som den som faktiskt låter. Behövs för
+/// att Teams/Zoom/Slack routar samtalsljud till *default kommunikationsenhet* (ofta ett
+/// BT-headsets HFP-endpoint) — en annan endpoint än console-defaulten, så en loopback
+/// som bara följer default_output_device() blir tyst mitt i mötet.
+///
+/// Designval: EN loopback som binds om ("follow-the-audio") i stället för att fånga
+/// alla endpoints samtidigt — session-recordern parar mic/sys sampel-för-sampel till
+/// stereo-WAV och MergedVad förutsätter en enda sys-producent; en mixer för N strömmar
+/// vore en ombyggnad av hela nedströmskedjan. Per-process-loopback (fånga Teams direkt)
+/// stöds inte av cpal — framtida möjlighet.
+enum SysTarget {
+    Default,
+    Pinned(String),
+}
+
 /// Aktiv WASAPI-loopback mot en specifik utgångsenhet. När strömmen droppas kopplas
 /// sample-kanalen ner, processor-tråden avslutar sin `for sample in rx`-loop och
 /// force-flushar pågående VAD-segment — gamla trådar städar alltså sig själva.
@@ -611,9 +842,15 @@ struct SysCapture {
     failed: Arc<AtomicBool>,
 }
 
-/// Bygger systemljudfångsten (WASAPI-loopback) mot AKTUELL default-utgång och spawnar
-/// dess processor-tråd. Best-effort: alla felvägar → None (mic-vägen dör aldrig av
-/// saknat systemljud). Anropas vid motorstart och vid varje rebind i huvudloopen.
+/// Bygger systemljudfångsten (WASAPI-loopback) och spawnar dess processor-tråd.
+/// `target: Some(name)` binder mot en specifik endpoint (follow-the-audio); saknas den
+/// eller vägrar den starta (vissa BT-HFP-endpoints tar inte loopback) faller vi tillbaka
+/// till default-utgången REDAN HÄR — utan intern fallback skulle en vägrande pin lämna
+/// sys_capture = None till nästa 2s-poll, dvs. ett fångstgap mitt i inspelningen.
+/// Anroparen upptäcker fallbacken via device_name-mismatch och återgår till
+/// SysTarget::Default + karantän. `target: None` = default-utgången (dagens beteende).
+/// Best-effort: alla felvägar → None (mic-vägen dör aldrig av saknat systemljud).
+/// Anropas vid motorstart och vid varje rebind i huvudloopen.
 fn build_sys_capture(
     host: &cpal::Host,
     app: &AppHandle,
@@ -622,7 +859,23 @@ fn build_sys_capture(
     settings: &Arc<Mutex<AudioSettings>>,
     is_recording: &Arc<Mutex<bool>>,
     session_state: &Arc<Mutex<SessionState>>,
+    target: Option<&str>,
 ) -> Option<SysCapture> {
+    if let Some(name) = target {
+        match find_output_device(host, name) {
+            Some(device) => {
+                if let Some(cap) = try_sys_capture(
+                    device, app, level_tx, session_tx, settings, is_recording, session_state,
+                ) {
+                    return Some(cap);
+                }
+                eprintln!("DEBUG: Pinned device {:?} failed to start, falling back to default", name);
+            }
+            None => {
+                eprintln!("DEBUG: Pinned output device {:?} not found, falling back to default", name);
+            }
+        }
+    }
     let sys_device = match host.default_output_device() {
         Some(d) => d,
         None => {
@@ -630,8 +883,22 @@ fn build_sys_capture(
             return None;
         }
     };
+    try_sys_capture(sys_device, app, level_tx, session_tx, settings, is_recording, session_state)
+}
+
+/// Försöker starta loopback-fångst mot exakt denna enhet — ingen fallback här;
+/// build_sys_capture äger fallback-beslutet.
+fn try_sys_capture(
+    sys_device: cpal::Device,
+    app: &AppHandle,
+    level_tx: &Sender<AudioInput>,
+    session_tx: &Sender<SessionChunk>,
+    settings: &Arc<Mutex<AudioSettings>>,
+    is_recording: &Arc<Mutex<bool>>,
+    session_state: &Arc<Mutex<SessionState>>,
+) -> Option<SysCapture> {
     let device_name = sys_device.name().unwrap_or_default();
-    println!("DEBUG: Default output device: {:?}", device_name);
+    println!("DEBUG: Binding system loopback to: {:?}", device_name);
 
     let sys_config = match sys_device.default_output_config() {
         Ok(c) => c,

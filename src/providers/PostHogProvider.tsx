@@ -5,7 +5,7 @@ import { captureEvent } from '@/hooks/use-posthog-events'
 
 const KEY = import.meta.env.VITE_POSTHOG_KEY as string | undefined
 const HOST = (import.meta.env.VITE_POSTHOG_HOST as string | undefined) ?? 'https://eu.i.posthog.com'
-const APP_VERSION = '0.9.33'
+const APP_VERSION = '0.9.34'
 
 if (KEY) {
     posthog.init(KEY, {

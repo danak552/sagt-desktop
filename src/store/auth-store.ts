@@ -26,6 +26,12 @@ interface AuthState {
     isPro: () => boolean
 }
 
+// Upsell-suppression, INTE entitlement: loadPersisted wipear hela sessionen
+// (inkl. stripeStatus) när JWT:n gått ut, så en betalande kund offline ser ut
+// som Free. Markören överlever expiry och läses bara av upsell-ytor för att
+// inte visa "köp Pro" för någon som redan betalar. Låser aldrig upp funktioner.
+export const WAS_PRO_KEY = "sagt_was_pro"
+
 function loadPersisted(): Partial<AuthState> {
     try {
         const raw = localStorage.getItem("sagt_auth")
@@ -70,6 +76,15 @@ export const useAuthStore = create<AuthState>((set, get) => ({
             isSignedIn: true,
         }
         localStorage.setItem("sagt_auth", JSON.stringify(state))
+        // Senast server-bekräftade sanningen styr: aktiv prenumeration sätter
+        // markören, uttryckligen icke-aktiv (churnad kund) rensar den så att
+        // lapsed users blir upsellbara igen. clearSession rör den medvetet
+        // inte — expiry/utloggning är exakt fallet markören ska överleva.
+        if (user.stripe_status === "active") {
+            localStorage.setItem(WAS_PRO_KEY, "1")
+        } else {
+            localStorage.removeItem(WAS_PRO_KEY)
+        }
         set(state)
     },
 

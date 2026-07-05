@@ -47,6 +47,11 @@ interface SyncState {
     // Styr post-stop: hoppa över hel-fil-uppladdning (segmenten kom redan från molnet).
     cloudStreamingActive: boolean;
     setCloudStreamingActive: (val: boolean) => void;
+    // Aktiv guardrail-varning från ljudmotorn ("Systemljud fångas inte" m.fl.).
+    // Persistent banner — en 10 s-toast missas lätt mitt i ett möte, och det här är
+    // exakt situationen där användaren måste agera INNAN mötet är över.
+    audioWarning: string | null;
+    setAudioWarning: (msg: string | null) => void;
     reset: () => void;
     resetToLive: () => void;
     resetSync: () => void;
@@ -66,6 +71,9 @@ export const useSyncStore = create<SyncState>((set) => ({
     pendingSpeakerData: null,
     effectiveMode: 'local', // Default, updated on mount/settings change
     isOnline: true,
+
+    audioWarning: null,
+    setAudioWarning: (msg) => set({ audioWarning: msg }),
 
     setEffectiveMode: (mode) => set({ effectiveMode: mode }),
     setIsOnline: (status) => set({ isOnline: status }),

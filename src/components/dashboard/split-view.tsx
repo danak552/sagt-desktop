@@ -12,12 +12,13 @@ import { Button } from "@/components/ui/button";
 import { getJob, reanalyzeTranscript, reanalyzeJob, uploadJob, identifySpeakers, SpeakerTurn } from "@/lib/api";
 import { applyInlineCloudResult, cloudSegmentsJsonFromJob } from "@/lib/cloud-sync";
 import { AnalysisData } from "@/store/sync-store";
-import { useAuthStore } from "@/store/auth-store";
+import { useAuthStore, WAS_PRO_KEY } from "@/store/auth-store";
 import { toast } from "sonner";
 import { ModePill } from "./mode-pill";
 import { UpsellModal } from "./upsell-modal";
 import { usePaymentRefresh } from "@/hooks/use-payment-refresh";
 import { usePostHogEvents } from "@/hooks/use-posthog-events";
+import { useSlowLocalHint } from "@/hooks/use-slow-local-hint";
 
 export function SplitView() {
     const isSignedIn = useAuthStore((s) => s.isSignedIn);
@@ -74,6 +75,19 @@ export function SplitView() {
     // Och endast medan inspelning pågår, så den inte ligger kvar efteråt.
     const cloudIntended = recordingMode === 'cloud' || recordingMode === 'cloud_analysis';
     const showLocalFallbackBadge = cloudIntended && !cloudStreamingActive && isRecording;
+
+    // Pro-hint vid långsam lokal transkribering: samma villkor som slutför-
+    // indikatorn i JSX:en nedan, begränsat till icke-Pro utan aktiv moln-ström.
+    // ≥ 15 s sammanhängande väntan → inline-kort (use-slow-local-hint).
+    // !isPro täcker även utloggad (stripeStatus null ⇒ false). WAS_PRO_KEY
+    // skyddar betalande kund vars JWT gått ut offline — loadPersisted wipear
+    // hela auth-sessionen vid expiry, men "köp Pro" ska aldrig visas för
+    // någon som redan betalar.
+    const isFinalizingLocal = isProcessing && !isRecording && processingStatus !== 'PROCESSING';
+    const { showSlowHint, dismissSlowHint } = useSlowLocalHint(
+        isFinalizingLocal && !isPro && !cloudStreamingActive
+        && !localStorage.getItem(WAS_PRO_KEY)
+    );
 
     // Per-modell-vy: en inspelning kan ha BÅDE lokala segment (Du/Mötet) och ett
     // molnresultat (KB-Whisper Large i cloud_transcript). Resultaten skriver aldrig
@@ -1061,7 +1075,7 @@ export function SplitView() {
                         {/* Local Finalizing Indicator */}
                         {/* #11: gata INTE på !activeJob — activeJob sätts direkt vid stopp medan
                             moln-kön fortfarande processar; indikatorn + Avbryt ska lysa tills klart. */}
-                        {isProcessing && !isRecording && processingStatus !== 'PROCESSING' && (
+                        {isFinalizingLocal && (
                             <div className="flex flex-col gap-3 animate-pulse pl-1 mt-4">
                                 <div className="flex items-center gap-2">
                                     <Loader2 className="w-4 h-4 animate-spin text-brand" />
@@ -1077,6 +1091,39 @@ export function SplitView() {
                                         Avbryt
                                     </Button>
                                 </div>
+                            </div>
+                        )}
+                        {/* Pro-hint: långsam lokal transkribering (≥15 s slutför-väntan, icke-Pro).
+                            Eget block utanför animate-pulse-containern så kortet inte blinkar.
+                            isFinalizingLocal-grinden är LASTBÄRANDE, inte redundant: när läget
+                            bryts släcker hookens effekt showSlowHint först en render senare —
+                            utan grinden flashar kortet en frame precis när resultatet visas. */}
+                        {isFinalizingLocal && showSlowHint && (
+                            <div className="max-w-sm rounded-xl border border-line bg-paper-dim p-4 mt-3 ml-1">
+                                <div className="flex items-start justify-between gap-3">
+                                    <h4 className="text-xs font-semibold text-ink">Därför tar det tid</h4>
+                                    <button
+                                        onClick={dismissSlowHint}
+                                        className="text-ink-muted hover:text-ink transition-colors flex-none"
+                                        aria-label="Visa inte igen"
+                                        title="Visa inte igen"
+                                    >
+                                        <X className="w-3.5 h-3.5" />
+                                    </button>
+                                </div>
+                                <p className="text-xs text-ink-muted mt-1.5 leading-relaxed">
+                                    AI-transkribering kräver ett kraftfullt grafikkort — utan det kör
+                                    appen den minsta modellen långsamt på processorn. Pro kör samma jobb
+                                    på dedikerade GPU-servrar med den största KB-Whisper-modellen:
+                                    snabbare och med högre kvalitet.
+                                </p>
+                                <Button
+                                    size="sm"
+                                    className="mt-3 h-8 text-xs bg-brand text-paper hover:bg-brand-deep"
+                                    onClick={() => setShowUpsellModal(true)}
+                                >
+                                    Se Pro
+                                </Button>
                             </div>
                         )}
                         <div ref={scrollRef} className="h-10" />

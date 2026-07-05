@@ -4,7 +4,7 @@
 
 [Download for Windows →](https://downloads.sagt.ai/Sagt.ai-setup.exe) | [sagt.ai](https://sagt.ai)
 
-**Current version: v0.9.33** — true turn-by-turn "who said what": each side of a meeting is now split into individual utterances and interleaved on the timeline, so re-transcribed recordings read as a real back-and-forth conversation (You / The meeting) instead of two channel-long blocks. Builds on v0.9.32's speaker identification — naming the people in a recording and suggesting names from the conversation (Pro).
+**Current version: v0.9.34** — system audio now "just works" for meetings: the loopback follows the output that's actually playing, so calls routed to a headset (Teams/Zoom on a communications device) are captured instead of silently missed. Also removes the email step at first launch (recording works fully offline, no sign-in), adds a gentle Pro hint when local transcription is slow, and hardens the Windows installer. Builds on v0.9.33's turn-by-turn "who said what" transcription.
 
 ![Sagt.ai Desktop — real-time Swedish transcription](assets/screenshot.png)
 

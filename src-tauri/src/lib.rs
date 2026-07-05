@@ -1,5 +1,6 @@
 // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
 mod audio;
+mod audio_meter;
 mod database;
 
 use database::{CleanupResult, DatabaseManager, Recording, Segment, StorageUsage};
