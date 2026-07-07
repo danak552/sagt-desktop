@@ -4,7 +4,7 @@
 
 [Download for Windows →](https://downloads.sagt.ai/Sagt.ai-setup.exe) | [sagt.ai](https://sagt.ai)
 
-**Current version: v0.9.35** — internal maintenance release: a code-quality refactor of the recording engine's per-recording state and a hardening of the release-signing pipeline (pinned build tooling plus a drift guard on the signature gate). No user-facing changes. Builds on v0.9.34's system-audio "just works" and offline-first improvements.
+**Current version: v0.9.36** — release-integrity release: the NSIS uninstaller (`uninstall.exe`) is now Authenticode-signed and RFC3161-timestamped, closing the last unsigned artifact in the installer. A new CI gate verifies the uninstaller signature on every build. No user-facing changes to the app itself. Builds on v0.9.35's signing-pipeline hardening and v0.9.34's system-audio "just works" and offline-first improvements.
 
 ![Sagt.ai Desktop — real-time Swedish transcription](assets/screenshot.png)
 
