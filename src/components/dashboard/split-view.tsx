@@ -1,6 +1,6 @@
 // Removed ScrollArea import
 import { Card } from "@/components/ui/card";
-import { FileText, Sparkles, History, Loader2, Copy, RefreshCw, Play, Cloud, Check, LogOut, Lock, Users, X } from "lucide-react";
+import { FileText, Sparkles, History, Loader2, Copy, RefreshCw, Play, Cloud, Check, LogOut, Lock, Users, UsersRound, X } from "lucide-react";
 import { useTranscription } from "@/hooks/use-transcription";
 import { cancelCloudStream } from "@/hooks/use-cloud-stream";
 import { useSyncStore } from "@/store/sync-store";
@@ -10,7 +10,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { useEffect, useRef, useState, useMemo } from "react";
 import { Button } from "@/components/ui/button";
 import { getJob, reanalyzeTranscript, reanalyzeJob, uploadJob, identifySpeakers, SpeakerTurn } from "@/lib/api";
-import { applyInlineCloudResult, cloudSegmentsJsonFromJob } from "@/lib/cloud-sync";
+import { applyInlineCloudResult, cloudSegmentsJsonFromJob, segmentsHaveDiarizationLabels, invalidateStaleSpeakerMap, stripUnstableSpeakerMapKeys } from "@/lib/cloud-sync";
 import { AnalysisData } from "@/store/sync-store";
 import { useAuthStore, WAS_PRO_KEY } from "@/store/auth-store";
 import { toast } from "sonner";
@@ -193,7 +193,33 @@ export function SplitView() {
         (sp === "mic" || sp === "DU") ? "DU" : (sp === "sys" || sp === "MÖTET") ? "MÖTET" : sp;
     const defaultLabel = (sp: string) => {
         const k = speakerKey(sp);
-        return k === "DU" ? "Du" : k === "MÖTET" ? "Mötet" : sp;
+        if (k === "DU") return "Du";
+        if (k === "MÖTET") return "Mötet";
+        // Fas 2: numrerade diariserings-etiketter → svensk titelform (TALARE 1 → "Talare 1").
+        const m = k.match(/^(DU|MÖTET|TALARE)\s+(\d+)$/);
+        if (m) {
+            const base = m[1] === "TALARE" ? "Talare" : m[1] === "DU" ? "Du" : "Mötet";
+            return `${base} ${m[2]}`;
+        }
+        return sp;
+    };
+
+    // Fas 2: deterministisk färg per talare (kanonisk nyckel) så flera röster särskiljs visuellt.
+    // Full literala Tailwind-klasser (JIT måste se dem). Nyckeln — inte råetiketten — så DU/mic
+    // och MÖTET/sys hamnar på samma färg.
+    const SPEAKER_COLORS = [
+        "text-blue-600 dark:text-blue-400",
+        "text-emerald-600 dark:text-emerald-400",
+        "text-amber-600 dark:text-amber-400",
+        "text-violet-600 dark:text-violet-400",
+        "text-rose-600 dark:text-rose-400",
+        "text-cyan-600 dark:text-cyan-400",
+    ];
+    const speakerColor = (sp: string) => {
+        const key = speakerKey(sp);
+        let h = 0;
+        for (let i = 0; i < key.length; i++) h = (h * 31 + key.charCodeAt(i)) >>> 0;
+        return SPEAKER_COLORS[h % SPEAKER_COLORS.length];
     };
 
     // #9: gruppera på varandra följande segment med SAMMA talare till en "tur" (som mockupen
@@ -251,6 +277,9 @@ export function SplitView() {
     // Re-analyze state
     const [isReanalyzing, setIsReanalyzing] = useState(false);
     const [isRetranscribing, setIsRetranscribing] = useState(false);
+    // Fas 2: opt-in talarseparering vid omtranskribering. num_speakers-hinten tas från
+    // deltagar-chipsens antal (0 → ingen hint, pyannote avgör fritt).
+    const [diarizeOnRetranscribe, setDiarizeOnRetranscribe] = useState(false);
     const [copiedKey, setCopiedKey] = useState<string | null>(null);
 
     const handleCopy = (text: string, key: string, e: React.MouseEvent<HTMLButtonElement>) => {
@@ -302,7 +331,11 @@ export function SplitView() {
         setIsRetranscribing(true);
         setUploadStatus('uploading');
         try {
-            const job = await uploadJob(uploadPath, "general", token, true);
+            const job = await uploadJob(
+                uploadPath, "general", token, true, undefined,
+                diarizeOnRetranscribe,
+                diarizeOnRetranscribe && participants.length > 0 ? participants.length : undefined,
+            );
             setUploadStatus('success');
             if (useSettingsStore.getState().cloudSync) {
                 setUploadedJobId(job.id);
@@ -311,6 +344,14 @@ export function SplitView() {
             } else {
                 const dbId = activeJob?.id ?? (currentSessionId ? parseInt(currentSessionId) : null);
                 const wc = await applyInlineCloudResult(job, dbId);
+                // R4: applyInlineCloudResult invaliderade speaker_map i DB/activeJob vid ny
+                // diarisering — spegla det i in-memory-staten (load-effekten refreshar bara
+                // history-jobb, så live-vägen måste strippas här också). Gate på det FAKTISKA
+                // resultatet (samma villkor som DB-invalideringen) — inte på toggeln — så DB
+                // och minne aldrig divergerar om kill switch är av och inga etiketter kom.
+                if (segmentsHaveDiarizationLabels(cloudSegmentsJsonFromJob(job))) {
+                    setSpeakerMap(prev => stripUnstableSpeakerMapKeys(prev));
+                }
                 events.cloudSyncCompleted(wc);
                 setTranscriptView('cloud'); // visa det nya molnresultatet direkt
                 toast.success("Transkriberad med KB-Whisper Large (resultat endast lokalt).");
@@ -758,12 +799,23 @@ export function SplitView() {
                                 cloudSegments: cloudSegmentsJson || "",
                             });
 
+                            // R4: ny diarisering (numrerade etiketter) → invalidera instabila
+                            // speaker_map-nycklar så gamla namn inte fastnar på fel omnumrerad röst.
+                            let speakerMapRaw: string | null = currentActiveJob.speaker_map ?? null;
+                            if (segmentsHaveDiarizationLabels(cloudSegmentsJson)) {
+                                const invalidated = await invalidateStaleSpeakerMap(currentActiveJob.id, speakerMapRaw);
+                                if (invalidated) speakerMapRaw = invalidated;
+                                // Spegla invalideringen i in-memory-staten (se inline-vägen ovan).
+                                setSpeakerMap(prev => stripUnstableSpeakerMapKeys(prev));
+                            }
+
                             // Persist cloud_transcript + cloud_segments so segments survive tab switches
                             const updatedJob = {
                                 ...currentActiveJob,
                                 analysis_json: JSON.stringify(completedAnalysis),
                                 cloud_transcript: cloudText || null,
                                 cloud_segments: cloudSegmentsJson,
+                                speaker_map: speakerMapRaw,
                             };
                             setActiveJob(updatedJob);
                         } catch (e) {
@@ -822,18 +874,36 @@ export function SplitView() {
                         {segments.length > 0 && !isRecording && !uploadedJobId && !isRetranscribing &&
                          !activeJob?.audio_deleted &&
                          (recordingMode === 'cloud' || recordingMode === 'cloud_analysis') && (
-                            <Button
-                                variant="ghost"
-                                size="icon"
-                                className="h-6 w-6 text-ink-muted hover:text-brand hover:bg-brand/5 ml-0.5 rounded-full"
-                                onClick={handleRetranscribe}
-                                title={segments.some(s => s.speaker === 'MOLN') ? "Transkribera om med KB-Whisper Large" : "Transkribera med KB-Whisper Large"}
-                            >
-                                {segments.some(s => s.speaker === 'MOLN')
-                                    ? <RefreshCw className="h-3.5 w-3.5" />
-                                    : <Cloud className="h-3.5 w-3.5" />
-                                }
-                            </Button>
+                            <>
+                                {/* Fas 2: "Separera talare"-toggle (Beta) — styr diarize-flaggan för nästa
+                                    omtranskribering. Highlightad när på. Pro/online-guarden ligger i handlern. */}
+                                <Button
+                                    variant="ghost"
+                                    size="icon"
+                                    className={`h-6 w-6 ml-0.5 rounded-full transition-colors ${diarizeOnRetranscribe ? "text-brand bg-brand/10" : "text-ink-muted hover:text-brand hover:bg-brand/5"}`}
+                                    onClick={() => setDiarizeOnRetranscribe(v => !v)}
+                                    title={diarizeOnRetranscribe
+                                        ? "Separera talare: PÅ — nästa omtranskribering delar upp rösterna (Talare 1, 2, 3…)"
+                                        : "Separera talare (Beta) — dela upp transkriptet per röst vid omtranskribering"}
+                                    aria-pressed={diarizeOnRetranscribe}
+                                >
+                                    <UsersRound className="h-3.5 w-3.5" />
+                                </Button>
+                                <Button
+                                    variant="ghost"
+                                    size="icon"
+                                    className="h-6 w-6 text-ink-muted hover:text-brand hover:bg-brand/5 ml-0.5 rounded-full"
+                                    onClick={handleRetranscribe}
+                                    title={
+                                        (diarizeOnRetranscribe ? "Transkribera om med talarseparering" : (segments.some(s => s.speaker === 'MOLN') ? "Transkribera om med KB-Whisper Large" : "Transkribera med KB-Whisper Large"))
+                                    }
+                                >
+                                    {segments.some(s => s.speaker === 'MOLN')
+                                        ? <RefreshCw className="h-3.5 w-3.5" />
+                                        : <Cloud className="h-3.5 w-3.5" />
+                                    }
+                                </Button>
+                            </>
                         )}
                         {/* Identifiera talare (Fas 1) — namnsätter Du/Mötet via LLM. Visas bara
                             när det finns talaretiketter att namnge, inte under inspelning.
@@ -1001,7 +1071,7 @@ export function SplitView() {
                                                     <button
                                                         type="button"
                                                         onClick={() => openRename(index, turn.speaker)}
-                                                        className={`font-semibold rounded hover:underline decoration-dotted underline-offset-2 transition-colors ${isDu ? "text-brand" : "text-rose-600"}`}
+                                                        className={`font-semibold rounded hover:underline decoration-dotted underline-offset-2 transition-colors ${isDu ? "text-brand" : speakerColor(turn.speaker)}`}
                                                         title="Klicka för att namnge talaren"
                                                     >
                                                         {speakerLabel(turn.speaker)}:

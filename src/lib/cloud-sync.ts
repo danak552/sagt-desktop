@@ -12,7 +12,10 @@ import type { Job } from "./api";
  */
 export function cloudSegmentsJsonFromJob(job: Job): string | null {
     const raw: any[] = Array.isArray(job.result?.segments) ? job.result.segments : [];
-    const hasSpeakers = raw.some(s => s?.speaker === "DU" || s?.speaker === "MÖTET");
+    // Fas 2: acceptera ALLA riktiga talaretiketter (DU/MÖTET men även diariserade TALARE 1/2,
+    // DU 1, MÖTET 2 …) — inte bara de två kanaletiketterna. Utan detta kollapsar en mono-
+    // diarisering (TALARE N) till den flata blobben i stället för att rendera turer.
+    const hasSpeakers = raw.some(s => s?.speaker && s.speaker !== "MOLN");
     if (!hasSpeakers) return null;
     const mapped = raw
         .filter(s => (s?.text ?? "").toString().trim())
@@ -23,6 +26,58 @@ export function cloudSegmentsJsonFromJob(job: Job): string | null {
             speaker: s.speaker || "MÖTET",
         }));
     return mapped.length > 0 ? JSON.stringify(mapped) : null;
+}
+
+// Fas 2 (R4): en NY diarisering kan numrera om talarna (TALARE 1 ↔ TALARE 2), så en sparad
+// speaker_map som namnger de gamla numren pekar då fel. Instabila = numrerade etiketter
+// (TALARE N, DU N, MÖTET N); stabila = bara "DU"/"MÖTET" (1-talarkanal, samma varje gång).
+const UNSTABLE_SPEAKER_KEY = /^(TALARE|DU|MÖTET)\s+\d+$/;
+
+/** True om cloud_segments-JSON:en innehåller numrerade diariserings-etiketter (ny diarisering). */
+export function segmentsHaveDiarizationLabels(cloudSegmentsJson: string | null): boolean {
+    if (!cloudSegmentsJson) return false;
+    try {
+        const arr = JSON.parse(cloudSegmentsJson);
+        return Array.isArray(arr) && arr.some((s: any) => UNSTABLE_SPEAKER_KEY.test(s?.speaker ?? ""));
+    } catch { return false; }
+}
+
+/** Returnerar en kopia av speaker_map utan instabila (omnumrerbara) nycklar. Delas av
+ *  DB-invalideringen och SplitViews in-memory-state så de aldrig divergerar (R4). */
+export function stripUnstableSpeakerMapKeys(map: Record<string, string>): Record<string, string> {
+    const kept: Record<string, string> = {};
+    for (const [k, v] of Object.entries(map)) {
+        if (!UNSTABLE_SPEAKER_KEY.test(k)) kept[k] = v;
+    }
+    return kept;
+}
+
+/**
+ * R4: strippa instabila (omnumrerbara) speaker_map-nycklar när en ny diarisering skrivs, så
+ * gamla namn inte hänger kvar på fel röst. Behåller participants + stabila DU/MÖTET-nycklar.
+ * Skriver till sqlite och returnerar den nya payloaden — eller null om inget behövde ändras.
+ */
+export async function invalidateStaleSpeakerMap(
+    recordingDbId: number | null,
+    speakerMapRaw: string | null | undefined,
+): Promise<string | null> {
+    if (recordingDbId == null || !speakerMapRaw) return null;
+    let parsed: any;
+    try { parsed = JSON.parse(speakerMapRaw); } catch { return null; }
+    const map = parsed?.map && typeof parsed.map === "object" ? parsed.map : {};
+    const kept = stripUnstableSpeakerMapKeys(map);
+    if (Object.keys(kept).length === Object.keys(map).length) return null; // inget instabilt att strippa
+    const payload = JSON.stringify({
+        map: kept,
+        participants: Array.isArray(parsed?.participants) ? parsed.participants : [],
+    });
+    try {
+        await invoke("save_speaker_map_to_db", { id: recordingDbId, speakerMap: payload });
+    } catch (e) {
+        console.error("R4 speaker_map-invalidering misslyckades:", e);
+        return null;
+    }
+    return payload;
 }
 
 /**
@@ -103,14 +158,23 @@ export async function applyInlineCloudResult(job: Job, recordingDbId: number | n
         }
     }
 
-    // Uppdatera activeJob med cloud_transcript + cloud_segments — men INGET cloud_job_id (ej synkat till moln).
+    // R4: en ny diarisering (numrerade etiketter i de nya turerna) → invalidera instabila
+    // speaker_map-nycklar så gamla namn inte hänger kvar på fel omnumrerad röst.
     const activeJob = sync.activeJob;
+    let speakerMapRaw: string | null = activeJob?.speaker_map ?? null;
+    if (recordingDbId != null && segmentsHaveDiarizationLabels(cloudSegmentsJson)) {
+        const invalidated = await invalidateStaleSpeakerMap(recordingDbId, speakerMapRaw);
+        if (invalidated) speakerMapRaw = invalidated;
+    }
+
+    // Uppdatera activeJob med cloud_transcript + cloud_segments — men INGET cloud_job_id (ej synkat till moln).
     if (activeJob) {
         sync.setActiveJob({
             ...activeJob,
             analysis_json: JSON.stringify(completedAnalysis),
             cloud_transcript: cloudText || null,
             cloud_segments: cloudSegmentsJson,
+            speaker_map: speakerMapRaw,
         });
     }
 

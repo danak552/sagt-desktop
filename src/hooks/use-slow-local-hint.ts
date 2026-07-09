@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { usePostHogEvents } from "./use-posthog-events";
+import { useDismissible } from "./use-dismissible";
 
 // Pro-hint vid långsam lokal transkribering. Triggern är medvetet enkel (v1):
 // "Slutför transkribering"-läget som kvarstår >= 15 s efter stopp är en direkt
@@ -22,11 +23,11 @@ let upsellEventSent = false;
 export function useSlowLocalHint(eligible: boolean) {
     const events = usePostHogEvents();
     const [show, setShow] = useState(false);
-    // Läses en gång per visningsbeslut — inte reaktivt, men avfärdan går via
-    // dismiss() som också sätter state, så UI:t är alltid konsistent.
-    const [dismissed, setDismissed] = useState(
-        () => !!localStorage.getItem(DISMISS_KEY)
-    );
+    // Avfärdan (localStorage) delas med andra kort via useDismissible. Boolean-
+    // läget ("1") bevarar exakt originalvillkoret: en gång avfärdad, för alltid.
+    // PostHog-flaggan nedan (upsellEventSent) hör INTE hemma i hooken — den är
+    // hint-specifik, per appsession, inte per persisterad avfärdan.
+    const { dismissed, dismiss } = useDismissible(DISMISS_KEY);
 
     useEffect(() => {
         if (!eligible || dismissed) {
@@ -46,11 +47,10 @@ export function useSlowLocalHint(eligible: boolean) {
         // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [eligible, dismissed]);
 
-    const dismiss = () => {
-        localStorage.setItem(DISMISS_KEY, "1");
-        setDismissed(true);
+    const dismissSlowHint = () => {
+        dismiss();
         setShow(false);
     };
 
-    return { showSlowHint: show, dismissSlowHint: dismiss };
+    return { showSlowHint: show, dismissSlowHint };
 }

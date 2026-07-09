@@ -70,7 +70,7 @@ export async function transcribeChunk(
     return await response.json();
 }
 
-export async function uploadJob(filePath: string, templateId: string = "general", token: string, performAnalysis: boolean = true, persistOverride?: boolean): Promise<Job> {
+export async function uploadJob(filePath: string, templateId: string = "general", token: string, performAnalysis: boolean = true, persistOverride?: boolean, diarize: boolean = false, numSpeakers?: number): Promise<Job> {
     const { backendUrl, retentionPolicy, transcriptionLanguage, cloudSync } = useSettingsStore.getState();
 
     // TODO: Replace localhost with https://api.sagt.ai for production builds. (We will inject this variable during the actual build command).
@@ -100,6 +100,10 @@ export async function uploadJob(filePath: string, templateId: string = "general"
     // Opt-in molnsynk: persist=true → resultatet sparas i molnet (dashboard). Default av →
     // backend returnerar resultatet inline och raderar jobbet (inget moln-spår).
     formData.append("persist", String(persistOverride ?? cloudSync));
+    // Fas 2: talarseparering (opt-in, Pro). Skickas bara när påslaget → gamla beteendet
+    // oförändrat annars. Backend ignorerar tyst om DIARIZE_ENABLED=false i miljön.
+    if (diarize) formData.append("diarize", "true");
+    if (numSpeakers && numSpeakers > 0) formData.append("num_speakers", String(numSpeakers));
 
     // 4. Upload
     // Ensure backendUrl doesn't have trailing slash if we add one, or handle it
