@@ -1,6 +1,6 @@
 // Removed ScrollArea import
 import { Card } from "@/components/ui/card";
-import { FileText, Sparkles, History, Loader2, Copy, RefreshCw, Play, Cloud, Check, LogOut, Lock, Users, UsersRound, X } from "lucide-react";
+import { FileText, Sparkles, History, Loader2, Copy, RefreshCw, Play, Cloud, Check, LogOut, Lock, Users, X } from "lucide-react";
 import { useTranscription } from "@/hooks/use-transcription";
 import { cancelCloudStream } from "@/hooks/use-cloud-stream";
 import { useSyncStore } from "@/store/sync-store";
@@ -9,7 +9,8 @@ import { useTranscriptionStore, UISegment } from "@/store/transcription-store";
 import { invoke } from "@tauri-apps/api/core";
 import { useEffect, useRef, useState, useMemo } from "react";
 import { Button } from "@/components/ui/button";
-import { getJob, reanalyzeTranscript, reanalyzeJob, uploadJob, identifySpeakers, SpeakerTurn } from "@/lib/api";
+import { DropdownMenu, DropdownMenuTrigger, DropdownMenuContent, DropdownMenuItem, DropdownMenuSeparator } from "@/components/ui/dropdown-menu";
+import { getJob, reanalyzeTranscript, reanalyzeJob, uploadJob, identifySpeakers, SpeakerTurn, Job } from "@/lib/api";
 import { applyInlineCloudResult, cloudSegmentsJsonFromJob, segmentsHaveDiarizationLabels, invalidateStaleSpeakerMap, stripUnstableSpeakerMapKeys } from "@/lib/cloud-sync";
 import { AnalysisData } from "@/store/sync-store";
 import { useAuthStore, WAS_PRO_KEY } from "@/store/auth-store";
@@ -187,6 +188,17 @@ export function SplitView() {
     const [newParticipant, setNewParticipant] = useState("");
     const [isIdentifying, setIsIdentifying] = useState(false);
 
+    // §13.1: refs så auto-namngivningen (som körs efter en diarisering) läser FÄRSK map +
+    // deltagarlista även från den stale polling-effekt-closuren (dess deps utelämnar dessa
+    // avsiktligt). Utan detta skulle auto-kedjan merga ovanpå ett inaktuellt map.
+    const speakerMapRef = useRef(speakerMap);
+    const participantsRef = useRef(participants);
+    useEffect(() => { speakerMapRef.current = speakerMap; }, [speakerMap]);
+    useEffect(() => { participantsRef.current = participants; }, [participants]);
+    // §13.3: in-flight-guard för slå-ihop (popovern stängs synkront, men skyddar mot
+    // blixtsnabb återöppning + nytt merge medan första invoken är i luften).
+    const mergingRef = useRef(false);
+
     // Kanonisk etikett: mic/DU → "DU", sys/MÖTET → "MÖTET" (segment kan bära endera formen).
     // Mappning och hints nycklas på den kanoniska formen så de två varianterna inte splittras.
     const speakerKey = (sp: string) =>
@@ -277,9 +289,6 @@ export function SplitView() {
     // Re-analyze state
     const [isReanalyzing, setIsReanalyzing] = useState(false);
     const [isRetranscribing, setIsRetranscribing] = useState(false);
-    // Fas 2: opt-in talarseparering vid omtranskribering. num_speakers-hinten tas från
-    // deltagar-chipsens antal (0 → ingen hint, pyannote avgör fritt).
-    const [diarizeOnRetranscribe, setDiarizeOnRetranscribe] = useState(false);
     const [copiedKey, setCopiedKey] = useState<string | null>(null);
 
     const handleCopy = (text: string, key: string, e: React.MouseEvent<HTMLButtonElement>) => {
@@ -311,7 +320,9 @@ export function SplitView() {
         }
     };
 
-    const handleRetranscribe = async () => {
+    // §13.2: `diarize` skickas explicit från dropdown-valen (inte via async toggle-state) → immun
+    // mot att en state-uppdatering inte hunnit landa vid klick.
+    const handleRetranscribe = async (diarize: boolean = false) => {
         if (!isSignedIn || !isPro) { setShowUpsellModal(true); return; }
         if (!navigator.onLine) { toast.error("Denna funktion kräver internetanslutning."); return; }
         if (activeJob?.audio_deleted) {
@@ -333,8 +344,12 @@ export function SplitView() {
         try {
             const job = await uploadJob(
                 uploadPath, "general", token, true, undefined,
-                diarizeOnRetranscribe,
-                diarizeOnRetranscribe && participants.length > 0 ? participants.length : undefined,
+                diarize,
+                diarize && participants.length > 0 ? participants.length : undefined,
+                // §13.4: hint om att mikrofonkanalen (DU) bara har en talare → hindrar
+                // Du 1/Du 2-översegmentering. Skickas bara vid diarisering; backend
+                // applicerar den enbart på stereo-vägens DU-kanal (mono ignorerar).
+                diarize && useSettingsStore.getState().micIsSingleSpeaker ? 1 : undefined,
             );
             setUploadStatus('success');
             if (useSettingsStore.getState().cloudSync) {
@@ -347,14 +362,23 @@ export function SplitView() {
                 // R4: applyInlineCloudResult invaliderade speaker_map i DB/activeJob vid ny
                 // diarisering — spegla det i in-memory-staten (load-effekten refreshar bara
                 // history-jobb, så live-vägen måste strippas här också). Gate på det FAKTISKA
-                // resultatet (samma villkor som DB-invalideringen) — inte på toggeln — så DB
+                // resultatet (samma villkor som DB-invalideringen) — inte på valet — så DB
                 // och minne aldrig divergerar om kill switch är av och inga etiketter kom.
-                if (segmentsHaveDiarizationLabels(cloudSegmentsJsonFromJob(job))) {
-                    setSpeakerMap(prev => stripUnstableSpeakerMapKeys(prev));
+                const hadDiar = segmentsHaveDiarizationLabels(cloudSegmentsJsonFromJob(job));
+                let baseMap = speakerMapRef.current;
+                if (hadDiar) {
+                    baseMap = stripUnstableSpeakerMapKeys(baseMap);
+                    setSpeakerMap(baseMap);
                 }
                 events.cloudSyncCompleted(wc);
                 setTranscriptView('cloud'); // visa det nya molnresultatet direkt
                 toast.success("Transkriberad med KB-Whisper Large (resultat endast lokalt).");
+                // §13.1: auto-kedja namngivningen (tyst) direkt efter en diarisering → namn dyker
+                // upp av sig själv när cues finns; annars står "Talare N" kvar. Pro/online-guard
+                // ligger i runIdentify. Turer byggs ur det FÄRSKA jobbet (inte den stale `turns`-memon).
+                if (hadDiar) {
+                    await runIdentify(turnsFromJob(job), participantsRef.current, baseMap, { silent: true });
+                }
             }
         } catch (error: any) {
             setUploadStatus('error');
@@ -434,6 +458,61 @@ export function SplitView() {
         cancelRename();
     };
 
+    // §13.3: slå-ihop gäller bara diariserade molnturer (cloud_segments) — det är där
+    // översegmentering (Du 1/Du 2) uppstår. Lokala live-segment (rena DU/MÖTET) berörs ej.
+    const mergeableView = cloudStructured.length > 0 && (!hasModelToggle || transcriptView === 'cloud');
+
+    // §13.3: slå ihop talare `fromSp` → `toKey`: relabela cloud_segments (kanoniska nycklar,
+    // målets RÅETIKETT bevaras) + persistera DB→activeJob→speaker_map i den ordningen så
+    // persistSpeakerData:s färska getState-läsning ser de nya segmenten (store↔DB-synk, R4).
+    // Irreversibelt per design — en ny "Transkribera om med talarseparering" återskapar etiketterna.
+    const mergeSpeakers = async (fromSp: string, toKey: string) => {
+        const fromKey = speakerKey(fromSp);
+        // Stäng popovern SYNKRONT före async-arbetet — annars kan ett andra chip-klick i samma
+        // popover köra mot samma stale closure och tyst skriva över det första merget.
+        cancelRename();
+        if (fromKey === toKey) return;
+        if (mergingRef.current) return; // blixtsnabb återöppning under pågående merge
+        mergingRef.current = true;
+        try {
+            const rawJson = activeJob?.cloud_segments;
+            const id = activeJob?.id ?? (currentSessionId ? parseInt(currentSessionId) : null);
+            if (!rawJson || id == null) { toast.error("Ihopslagning kräver ett sparat molnresultat."); return; }
+            let arr: any[];
+            try { arr = JSON.parse(rawJson); } catch { toast.error("Kunde inte läsa talarturerna."); return; }
+            if (!Array.isArray(arr)) { toast.error("Kunde inte läsa talarturerna."); return; }
+            // Målets råetikett (första förekomsten) — skriv den, inte den kanoniska nyckeln, så
+            // formatet i cloud_segments förblir vad backend producerade.
+            const toRaw = arr.find(s => speakerKey(String(s?.speaker ?? "")) === toKey)?.speaker ?? toKey;
+            const nextArr = arr.map(s =>
+                speakerKey(String(s?.speaker ?? "")) === fromKey ? { ...s, speaker: toRaw } : s
+            );
+            const nextJson = JSON.stringify(nextArr);
+            try {
+                await invoke("save_cloud_segments_to_db", { id, cloudSegments: nextJson });
+            } catch (e) {
+                console.error("Kunde inte spara ihopslagning:", e);
+                toast.error("Kunde inte spara ihopslagningen.");
+                return;
+            }
+            // Färsk state + bevara fromHistory (samma mönster som persistSpeakerData).
+            const aj = useSyncStore.getState().activeJob;
+            if (aj && aj.id === id) {
+                setActiveJob({ ...aj, cloud_segments: nextJson }, useSyncStore.getState().activeJobFromHistory);
+            }
+            // speaker_map: källans post bort; målet ärver namnet bara om det själv saknar ett.
+            const nextMap = { ...speakerMap };
+            const fromName = nextMap[fromKey];
+            delete nextMap[fromKey];
+            if (fromName && !nextMap[toKey]) nextMap[toKey] = fromName;
+            setSpeakerMap(nextMap);
+            await persistSpeakerData(nextMap, participants);
+            toast.success(`Slog ihop ${defaultLabel(fromSp)} med ${nextMap[toKey] || defaultLabel(toKey)}.`);
+        } finally {
+            mergingRef.current = false;
+        }
+    };
+
     const addParticipant = () => {
         const name = newParticipant.trim();
         if (!name || participants.includes(name)) { setNewParticipant(""); return; }
@@ -449,35 +528,54 @@ export function SplitView() {
         persistSpeakerData(speakerMap, next);
     };
 
-    // "Identifiera talare": LLM-förslag som FÖRIFYLLER etiketterna (Pro + online-guard,
-    // samma mönster som handleRetranscribe). Användaren korrigerar genom att klicka.
-    const handleIdentifySpeakers = async () => {
-        if (!isSignedIn || !isPro) { setShowUpsellModal(true); return; }
-        if (!navigator.onLine) { toast.error("Denna funktion kräver internetanslutning."); return; }
-        const token = getToken();
-        if (!token) { toast.error("Kunde inte hämta autentiseringstoken. Logga in igen."); return; }
+    // §13.1: bygg kanoniska turer ur ett FÄRSKT jobbresultat (inte den stale `turns`-memon) —
+    // används av auto-namngivningen direkt efter en diarisering, innan React räknat om `turns`.
+    const turnsFromJob = (job: Job): SpeakerTurn[] => {
+        const raw: any[] = Array.isArray(job.result?.segments) ? job.result.segments : [];
+        return raw
+            .map(s => ({ speaker: String(s?.speaker ?? ""), text: String(s?.text ?? "").trim(), start: typeof s?.start === "number" ? s.start : null }))
+            .filter(t => t.text && t.speaker && t.speaker !== "MOLN")
+            .map(t => ({ speaker: speakerKey(t.speaker), text: t.text, start: t.start }));
+    };
 
-        // Skicka kanoniska etiketter; hoppa över MOLN (sammanhängande molntext har inga talare).
-        const apiTurns: SpeakerTurn[] = turns
-            .filter(t => t.speaker !== "MOLN")
-            .map(t => ({ speaker: speakerKey(t.speaker), text: t.text, start: t.start_time ?? null }));
-        if (apiTurns.length === 0) { toast.error("Inga talarsegment att identifiera."); return; }
+    // §13.1: kärnan i talaridentifiering, delad av den manuella "Namnge talare igen" och
+    // auto-kedjan. Icke-förstörande: mergar LLM-förslag ovanpå `baseMap` (turerna rörs aldrig).
+    // silent = auto-läget: dämpade toaster + fel sväljs (ska aldrig gnälla på användaren).
+    const runIdentify = async (
+        apiTurns: SpeakerTurn[],
+        parts: string[],
+        baseMap: Record<string, string>,
+        opts: { silent?: boolean } = {},
+    ) => {
+        const silent = !!opts.silent;
+        if (!isSignedIn || !isPro) { if (!silent) setShowUpsellModal(true); return; }
+        if (!navigator.onLine) { if (!silent) toast.error("Denna funktion kräver internetanslutning."); return; }
+        const token = getToken();
+        if (!token) { if (!silent) toast.error("Kunde inte hämta autentiseringstoken. Logga in igen."); return; }
+        if (apiTurns.length === 0) { if (!silent) toast.error("Inga talarsegment att identifiera."); return; }
 
         setIsIdentifying(true);
-        events.speakersIdentifyRequested();
+        // Metriken speglar ANVÄNDARINITIERAD identifiering — fyra den inte på auto-kedjan
+        // (silent), annars inflateras "requested" av de automatiska anropen.
+        if (!silent) events.speakersIdentifyRequested();
         try {
-            const result = await identifySpeakers(apiTurns, participants, token);
+            const result = await identifySpeakers(apiTurns, parts, token);
             const suggested = result.speaker_map || {};
             const count = Object.keys(suggested).length;
             if (count === 0) {
-                toast.info("Kunde inte härleda namn ur samtalet. Klicka på en etikett för att namnge manuellt.");
-            } else {
-                const next = { ...speakerMap, ...suggested };
-                setSpeakerMap(next);
-                persistSpeakerData(next, participants);
-                toast.success(`Identifierade ${count} talare. Klicka på ett namn för att ändra.`);
+                if (!silent) toast.info("Kunde inte härleda namn ur samtalet. Klicka på en etikett för att namnge manuellt.");
+                return;
             }
+            const next = { ...baseMap, ...suggested };
+            setSpeakerMap(next);
+            persistSpeakerData(next, parts);
+            toast.success(
+                silent
+                    ? `Namngav ${count} talare automatiskt. Klicka på ett namn för att ändra.`
+                    : `Identifierade ${count} talare. Klicka på ett namn för att ändra.`
+            );
         } catch (error: any) {
+            if (silent) { console.warn("Auto-namngivning misslyckades:", error?.message || error); return; }
             if (error?.message?.startsWith("Unauthorized")) {
                 clearSession();
                 toast.error("Din session är inte längre giltig. Logga in igen.");
@@ -489,6 +587,14 @@ export function SplitView() {
         } finally {
             setIsIdentifying(false);
         }
+    };
+
+    // Manuell "Namnge talare igen": bygger turer ur den visade vyn (hoppar MOLN).
+    const handleIdentifySpeakers = () => {
+        const apiTurns: SpeakerTurn[] = turns
+            .filter(t => t.speaker !== "MOLN")
+            .map(t => ({ speaker: speakerKey(t.speaker), text: t.text, start: t.start_time ?? null }));
+        return runIdentify(apiTurns, participants, speakerMap, { silent: false });
     };
 
     const handleAction = async () => {
@@ -823,6 +929,14 @@ export function SplitView() {
                         }
                     }
 
+                    // §13.1: auto-kedja namngivningen (tyst) efter en molndiarisering. Turer ur
+                    // det FÄRSKA jobbet; basmap ur ref (polling-closuren är avsiktligt stale).
+                    // Guard: bara vid diarisering — Pro/online-kontrollen ligger i runIdentify.
+                    if (segmentsHaveDiarizationLabels(cloudSegmentsJson)) {
+                        const base = stripUnstableSpeakerMapKeys(speakerMapRef.current);
+                        await runIdentify(turnsFromJob(job), participantsRef.current, base, { silent: true });
+                    }
+
                     clearInterval(interval);
                 } else if (job.status === 'FAILED') {
                     console.error("Job failed processing:", job.error_message);
@@ -869,57 +983,58 @@ export function SplitView() {
                                 {copiedKey === "transcript" ? <Check className="h-3.5 w-3.5 text-green-500" /> : <Copy className="h-3.5 w-3.5" />}
                             </Button>
                         )}
-                        {/* Re-transcribe with Large — shown when cloud mode is selected, not currently recording/processing.
-                            Döljs när ljudfilen är gallrad (auto-gallring) — uppladdningen kräver WAV:en. */}
-                        {segments.length > 0 && !isRecording && !uploadedJobId && !isRetranscribing &&
-                         !activeJob?.audio_deleted &&
-                         (recordingMode === 'cloud' || recordingMode === 'cloud_analysis') && (
-                            <>
-                                {/* Fas 2: "Separera talare"-toggle (Beta) — styr diarize-flaggan för nästa
-                                    omtranskribering. Highlightad när på. Pro/online-guarden ligger i handlern. */}
-                                <Button
-                                    variant="ghost"
-                                    size="icon"
-                                    className={`h-6 w-6 ml-0.5 rounded-full transition-colors ${diarizeOnRetranscribe ? "text-brand bg-brand/10" : "text-ink-muted hover:text-brand hover:bg-brand/5"}`}
-                                    onClick={() => setDiarizeOnRetranscribe(v => !v)}
-                                    title={diarizeOnRetranscribe
-                                        ? "Separera talare: PÅ — nästa omtranskribering delar upp rösterna (Talare 1, 2, 3…)"
-                                        : "Separera talare (Beta) — dela upp transkriptet per röst vid omtranskribering"}
-                                    aria-pressed={diarizeOnRetranscribe}
-                                >
-                                    <UsersRound className="h-3.5 w-3.5" />
-                                </Button>
-                                <Button
-                                    variant="ghost"
-                                    size="icon"
-                                    className="h-6 w-6 text-ink-muted hover:text-brand hover:bg-brand/5 ml-0.5 rounded-full"
-                                    onClick={handleRetranscribe}
-                                    title={
-                                        (diarizeOnRetranscribe ? "Transkribera om med talarseparering" : (segments.some(s => s.speaker === 'MOLN') ? "Transkribera om med KB-Whisper Large" : "Transkribera med KB-Whisper Large"))
-                                    }
-                                >
-                                    {segments.some(s => s.speaker === 'MOLN')
-                                        ? <RefreshCw className="h-3.5 w-3.5" />
-                                        : <Cloud className="h-3.5 w-3.5" />
-                                    }
-                                </Button>
-                            </>
-                        )}
-                        {/* Identifiera talare (Fas 1) — namnsätter Du/Mötet via LLM. Visas bara
-                            när det finns talaretiketter att namnge, inte under inspelning.
-                            Pro/online-guard hanteras i handlern (samma mönster som omtranskribera). */}
-                        {segments.length > 0 && !isRecording && hasNamableSpeakers && (
-                            <Button
-                                variant="ghost"
-                                size="icon"
-                                className="h-6 w-6 text-ink-muted hover:text-brand hover:bg-brand/5 ml-0.5 rounded-full"
-                                onClick={handleIdentifySpeakers}
-                                disabled={isIdentifying}
-                                title={isPro ? "Identifiera talare — namnsätt Du/Mötet" : "Identifiera talare (Pro)"}
-                            >
-                                {isIdentifying ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Users className="h-3.5 w-3.5" />}
-                            </Button>
-                        )}
+                        {/* §13.2: ETT åtgärdsmenyvalv i stället för tre separata knappar (toggle +
+                            omtranskribera + identifiera). "Det bara fungerar" — omtranskribering
+                            med/utan talarseparering + manuell "Namnge talare igen" (auto-kedjan kör
+                            annars namngivningen av sig själv efter en diarisering). Döljs helt när
+                            ingen åtgärd är möjlig (t.ex. ljudet gallrat + inga talare att namnge). */}
+                        {(() => {
+                            const canRetranscribe = segments.length > 0 && !isRecording && !uploadedJobId &&
+                                !isRetranscribing && !activeJob?.audio_deleted &&
+                                (recordingMode === 'cloud' || recordingMode === 'cloud_analysis');
+                            const canIdentify = segments.length > 0 && !isRecording && hasNamableSpeakers;
+                            if (!canRetranscribe && !canIdentify) return null;
+                            const busy = isRetranscribing || isIdentifying;
+                            return (
+                                <DropdownMenu>
+                                    <DropdownMenuTrigger asChild>
+                                        <Button
+                                            variant="ghost"
+                                            size="icon"
+                                            className="h-6 w-6 text-ink-muted hover:text-brand hover:bg-brand/5 ml-0.5 rounded-full"
+                                            disabled={busy}
+                                            title="Fler åtgärder"
+                                        >
+                                            {busy
+                                                ? <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                                                : (hasCloudResult ? <RefreshCw className="h-3.5 w-3.5" /> : <Cloud className="h-3.5 w-3.5" />)}
+                                        </Button>
+                                    </DropdownMenuTrigger>
+                                    <DropdownMenuContent align="start" className="w-64">
+                                        {canRetranscribe && (
+                                            <>
+                                                <DropdownMenuItem onClick={() => handleRetranscribe(true)} className="gap-2 cursor-pointer">
+                                                    <Users className="h-3.5 w-3.5 text-brand" />
+                                                    <span className="flex-1">Transkribera om med talarseparering</span>
+                                                    <span className="rounded bg-brand/10 px-1 py-0.5 text-[9px] font-semibold text-brand">Beta</span>
+                                                </DropdownMenuItem>
+                                                <DropdownMenuItem onClick={() => handleRetranscribe(false)} className="gap-2 cursor-pointer">
+                                                    <RefreshCw className="h-3.5 w-3.5 text-ink-muted" />
+                                                    Transkribera om (standard)
+                                                </DropdownMenuItem>
+                                            </>
+                                        )}
+                                        {canRetranscribe && canIdentify && <DropdownMenuSeparator />}
+                                        {canIdentify && (
+                                            <DropdownMenuItem onClick={handleIdentifySpeakers} className="gap-2 cursor-pointer">
+                                                <Sparkles className="h-3.5 w-3.5 text-ink-muted" />
+                                                Namnge talare igen
+                                            </DropdownMenuItem>
+                                        )}
+                                    </DropdownMenuContent>
+                                </DropdownMenu>
+                            );
+                        })()}
                     </h2>
                     <div className="flex items-center gap-3">
                         <ModePill onUpsellClick={() => setShowUpsellModal(true)} />
@@ -1072,7 +1187,7 @@ export function SplitView() {
                                                         type="button"
                                                         onClick={() => openRename(index, turn.speaker)}
                                                         className={`font-semibold rounded hover:underline decoration-dotted underline-offset-2 transition-colors ${isDu ? "text-brand" : speakerColor(turn.speaker)}`}
-                                                        title="Klicka för att namnge talaren"
+                                                        title="Namnge talaren"
                                                     >
                                                         {speakerLabel(turn.speaker)}:
                                                     </button>
@@ -1104,6 +1219,33 @@ export function SplitView() {
                                                                     ))}
                                                                 </span>
                                                             )}
+                                                            {/* §13.3: slå ihop denna talare med en annan (läker Du 1/Du 2-
+                                                                översegmentering). Bara i cloud-vyn där diariserade turer finns. */}
+                                                            {mergeableView && (() => {
+                                                                const selfKey = speakerKey(turn.speaker);
+                                                                const others = [...new Set(
+                                                                    turns.filter(t => t.speaker !== "MOLN").map(t => speakerKey(t.speaker))
+                                                                )].filter(k => k !== selfKey);
+                                                                if (others.length === 0) return null;
+                                                                return (
+                                                                    <span className="flex flex-col gap-1 pt-1 border-t border-line/60">
+                                                                        <span className="text-[10px] text-ink-muted">Samma röst? Slå ihop med:</span>
+                                                                        <span className="flex flex-wrap gap-1">
+                                                                            {others.map((k) => (
+                                                                                <button
+                                                                                    key={k}
+                                                                                    type="button"
+                                                                                    onClick={() => mergeSpeakers(turn.speaker, k)}
+                                                                                    title={`Alla "${speakerLabel(turn.speaker)}"-turer blir "${speakerMap[k] || defaultLabel(k)}"`}
+                                                                                    className="text-xs bg-paper-dim hover:bg-brand/10 text-ink-soft hover:text-brand border border-line rounded-full px-2 py-0.5"
+                                                                                >
+                                                                                    {speakerMap[k] || defaultLabel(k)}
+                                                                                </button>
+                                                                            ))}
+                                                                        </span>
+                                                                    </span>
+                                                                );
+                                                            })()}
                                                             <span className="flex items-center justify-end gap-2">
                                                                 <button type="button" onClick={cancelRename} className="text-xs text-ink-muted hover:text-ink-soft px-2 py-1">Avbryt</button>
                                                                 <button type="button" onClick={() => commitRename(turn.speaker)} className="text-xs font-medium bg-brand text-paper rounded-md px-3 py-1 hover:bg-brand-deep">Spara</button>

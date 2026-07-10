@@ -4,7 +4,7 @@
 
 [Download for Windows →](https://downloads.sagt.ai/Sagt.ai-setup.exe) | [sagt.ai](https://sagt.ai)
 
-**Current version: v0.9.37** — speaker separation (Beta, Pro): re-transcribe any recording with acoustic speaker diarization — voices are split into "Talare 1, 2, 3…" turns, rendered with per-speaker colors, and can be named via the existing AI speaker identification. Includes a participant-count hint for better accuracy on mono recordings. Powered by an EU-based diarization provider (pyannoteAI, France) — audio never leaves the EU. Builds on v0.9.36's release-integrity work (fully signed installer incl. uninstaller).
+**Current version: v0.9.38** — speaker separation UX polish (Beta, Pro): naming now runs automatically when a diarized result lands (no extra click), the re-transcribe controls are consolidated into a single dropdown, speakers can be merged from the label popover ("same voice? merge with…"), and a mic-channel hint treats your microphone as a single speaker by default — preventing "You 1"/"You 2" over-segmentation (toggle off for shared microphones). Builds on v0.9.37's acoustic diarization (voices split into "Talare 1, 2, 3…" turns via an EU-based provider, pyannoteAI, France — audio never leaves the EU).
 
 ![Sagt.ai Desktop — real-time Swedish transcription](assets/screenshot.png)
 

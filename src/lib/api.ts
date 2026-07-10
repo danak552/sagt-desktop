@@ -70,7 +70,7 @@ export async function transcribeChunk(
     return await response.json();
 }
 
-export async function uploadJob(filePath: string, templateId: string = "general", token: string, performAnalysis: boolean = true, persistOverride?: boolean, diarize: boolean = false, numSpeakers?: number): Promise<Job> {
+export async function uploadJob(filePath: string, templateId: string = "general", token: string, performAnalysis: boolean = true, persistOverride?: boolean, diarize: boolean = false, numSpeakers?: number, micSpeakers?: number): Promise<Job> {
     const { backendUrl, retentionPolicy, transcriptionLanguage, cloudSync } = useSettingsStore.getState();
 
     // TODO: Replace localhost with https://api.sagt.ai for production builds. (We will inject this variable during the actual build command).
@@ -104,6 +104,9 @@ export async function uploadJob(filePath: string, templateId: string = "general"
     // oförändrat annars. Backend ignorerar tyst om DIARIZE_ENABLED=false i miljön.
     if (diarize) formData.append("diarize", "true");
     if (numSpeakers && numSpeakers > 0) formData.append("num_speakers", String(numSpeakers));
+    // §13.4: DU/mik-kanalens talarantal (stereo) — desktop skickar 1 (ensam vid mikrofonen)
+    // som default → ingen Du 1/Du 2-översegmentering. Skickas bara vid diarisering.
+    if (diarize && micSpeakers && micSpeakers > 0) formData.append("mic_speakers", String(micSpeakers));
 
     // 4. Upload
     // Ensure backendUrl doesn't have trailing slash if we add one, or handle it

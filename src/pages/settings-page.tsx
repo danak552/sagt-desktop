@@ -39,6 +39,8 @@ export function SettingsPage() {
         setCloudDiarizationMode,
         pauseBreakMs,
         setPauseBreakMs,
+        micIsSingleSpeaker,
+        setMicIsSingleSpeaker,
         localAudioRetention,
         setLocalAudioRetention,
     } = useSettingsStore();
@@ -331,6 +333,34 @@ export function SettingsPage() {
                                     <p className="text-xs text-muted-foreground">
                                         En talpaus längre än detta ger ett nytt stycke (och extra luft i Du/Mötet-vyn).
                                     </p>
+                                </div>
+
+                                {/* §13.4 mic-kanal-hint — en talare vid mikrofonen (default på) */}
+                                <div className="space-y-3 pt-1">
+                                    <div>
+                                        <label className="text-sm font-medium text-ink-soft">Bara jag talar i mikrofonen</label>
+                                        <p className="text-xs text-muted-foreground mt-1">
+                                            <strong>På</strong> (standard): din mikrofonkanal behandlas som en enda talare — hindrar att du delas upp i "Du 1" och "Du 2".
+                                            <strong> Av</strong>: slå av om ni är flera som delar samma mikrofon.
+                                        </p>
+                                    </div>
+                                    <div className="grid grid-cols-2 gap-3">
+                                        {([
+                                            { value: true, label: '👤 På — en talare' },
+                                            { value: false, label: '👥 Av — flera talare' },
+                                        ] as { value: boolean; label: string }[]).map(({ value, label }) => (
+                                            <button
+                                                key={String(value)}
+                                                onClick={() => setMicIsSingleSpeaker(value)}
+                                                className={`px-3 py-2 rounded-md border text-sm font-medium transition-all ${micIsSingleSpeaker === value
+                                                    ? 'border-primary bg-primary/5 text-primary ring-1 ring-primary'
+                                                    : 'border-line bg-white text-ink-soft hover:bg-paper-dim'
+                                                }`}
+                                            >
+                                                {label}
+                                            </button>
+                                        ))}
+                                    </div>
                                 </div>
                             </div>
                         )}

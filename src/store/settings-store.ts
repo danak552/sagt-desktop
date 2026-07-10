@@ -29,6 +29,12 @@ interface SettingsState {
     // Tröskel (ms) för visuellt styckesbryt vid längre talpaus. Justerbar; default 1500.
     pauseBreakMs: number;
 
+    // §13.4 mic-kanal-hint: när true antar backend att DU-kanalen (mikrofonen) bara
+    // innehåller EN talare → num_speakers=1 skickas som hint till diariseringen och
+    // hindrar över-segmentering ("Du 1"/"Du 2"). Default true (vanligaste fallet:
+    // en person vid datorn). Stäng av om flera personer delar mikrofon.
+    micIsSingleSpeaker: boolean;
+
     // New unified mode
     recordingMode: 'cloud_analysis' | 'cloud' | 'local';
     defaultProMode: 'cloud_analysis' | 'cloud' | 'local';
@@ -53,6 +59,7 @@ interface SettingsState {
     setCloudSync: (val: boolean) => void;
     setCloudDiarizationMode: (mode: 'structured' | 'merged') => void;
     setPauseBreakMs: (ms: number) => void;
+    setMicIsSingleSpeaker: (val: boolean) => void;
 
     // Kept for backward compat, but calling them sets recordingMode under the hood
     setAutoTranscribeCloud: (val: boolean) => void;
@@ -77,6 +84,7 @@ export const useSettingsStore = create<SettingsState>()(
             cloudSync: false,
             cloudDiarizationMode: 'structured' as 'structured' | 'merged',
             pauseBreakMs: 1500,
+            micIsSingleSpeaker: true,
 
             // New unified mode — default 'local' så gratisanvändare inte möts av
             // molnläge-toast vid första inspelning
@@ -110,6 +118,7 @@ export const useSettingsStore = create<SettingsState>()(
             setCloudSync: (cloudSync) => set({ cloudSync }),
             setCloudDiarizationMode: (cloudDiarizationMode) => set({ cloudDiarizationMode }),
             setPauseBreakMs: (pauseBreakMs) => set({ pauseBreakMs }),
+            setMicIsSingleSpeaker: (micIsSingleSpeaker) => set({ micIsSingleSpeaker }),
 
             // Legacy mapping
             setAutoTranscribeCloud: (val) => set((state) => {
@@ -136,6 +145,7 @@ export const useSettingsStore = create<SettingsState>()(
                 cloudSync: false,
                 cloudDiarizationMode: 'structured',
                 pauseBreakMs: 1500,
+                micIsSingleSpeaker: true,
                 recordingMode: 'local',
                 defaultProMode: 'cloud',
                 modeExplicitlySet: false,
@@ -146,7 +156,7 @@ export const useSettingsStore = create<SettingsState>()(
         {
             name: 'swedish-whisper-settings',
             storage: createJSONStorage(() => localStorage),
-            version: 7,
+            version: 8,
             migrate: (state: any) => ({
                 ...state,
                 backendUrl: import.meta.env.PROD ? PROD_API_URL : 'http://localhost:8000',
@@ -163,6 +173,8 @@ export const useSettingsStore = create<SettingsState>()(
                 pauseBreakMs: state.pauseBreakMs ?? 1500,
                 // v7: lokal gallringspolicy — default behåll allt (offline-first, ljudet är enda kopian)
                 localAudioRetention: state.localAudioRetention ?? 'keep_all',
+                // v8: §13.4 mic-kanal-hint — default true (en talare vid mikrofonen)
+                micIsSingleSpeaker: state.micIsSingleSpeaker ?? true,
             }),
         }
     )
