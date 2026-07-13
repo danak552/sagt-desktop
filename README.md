@@ -4,7 +4,7 @@
 
 [Download for Windows →](https://downloads.sagt.ai/Sagt.ai-setup.exe) | [sagt.ai](https://sagt.ai)
 
-**Current version: v0.9.38** — speaker separation UX polish (Beta, Pro): naming now runs automatically when a diarized result lands (no extra click), the re-transcribe controls are consolidated into a single dropdown, speakers can be merged from the label popover ("same voice? merge with…"), and a mic-channel hint treats your microphone as a single speaker by default — preventing "You 1"/"You 2" over-segmentation (toggle off for shared microphones). Builds on v0.9.37's acoustic diarization (voices split into "Talare 1, 2, 3…" turns via an EU-based provider, pyannoteAI, France — audio never leaves the EU).
+**Current version: v0.9.39** — automatic speaker separation on stop (Beta, Pro): for streamed cloud recordings, speaker separation now runs by itself when you stop — no manual "re-transcribe" step. Two new layers: live speaker naming that names participants while the transcript grows during the meeting, and auto-diarization on stop that diarizes the meeting-channel audio in the EU (pyannoteAI, France — audio never leaves the EU) and maps the acoustic turns onto the already-streamed segments, then auto-names them. It runs alongside the auto-analysis and degrades silently to "You"/"Meeting" labels on any error, so the text is never blocked. Builds on v0.9.38's diarization UX (auto-naming, consolidated re-transcribe menu, merge speakers, mic-channel hint).
 
 ![Sagt.ai Desktop — real-time Swedish transcription](assets/screenshot.png)
 

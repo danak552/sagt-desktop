@@ -329,7 +329,9 @@ pub fn run() {
             save_cloud_segments_to_db,
             save_speaker_map_to_db,
             get_storage_usage,
-            cleanup_audio_storage
+            cleanup_audio_storage,
+            audio::extract_meeting_channel,
+            audio::delete_diarize_temp
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

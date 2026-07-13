@@ -2247,3 +2247,146 @@ fn try_save_session(app: &AppHandle, session_state: &Arc<Mutex<SessionState>>) {
         }
     }
 }
+
+/// Extraherar MÖTET-kanalen (höger, R = sys) ur en stereo sessions-WAV och skriver den
+/// som mono 16 kHz i16 till `app_data/diarize_temp/`. Returnerar sökvägen till mono-filen.
+///
+/// Motiv: sessions-WAV:en är stereo (L = mic/DU, R = sys/MÖTET, se sessions-recordern ovan).
+/// 4h stereo ≈ 880 MB överstiger backendens 500 MB-gräns; mono-MÖTET ≈ 440 MB räcker för
+/// auto-diarisering vid stopp — DU-kanalen är redan en känd enskild talare via mic-hinten (§13.4).
+///
+/// JS anropar med camelCase-nyckel: `invoke("extract_meeting_channel", { path })`.
+#[tauri::command]
+pub async fn extract_meeting_channel(app: AppHandle, path: String) -> Result<String, String> {
+    // Sökvägsvakt (speglar read_audio_file i lib.rs): endast filer under appens datakatalog.
+    // canonicalize båda sidor — på Windows ger canonicalize \\?\-UNC-prefix, vilket gör att
+    // starts_with annars misslyckas mot en icke-canonicaliserad app_data.
+    let requested = std::fs::canonicalize(&path)
+        .map_err(|e| format!("Ogiltig sökväg: {}", e))?;
+    let app_data = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| format!("Kunde inte bestämma datakatalog: {}", e))?;
+    let app_data = std::fs::canonicalize(&app_data)
+        .map_err(|e| format!("Kunde inte normalisera datakatalog: {}", e))?;
+    if !requested.starts_with(&app_data) {
+        return Err("Åtkomst nekad: sökvägen ligger utanför appens datakatalog.".to_string());
+    }
+
+    // Utkatalog under app data (INTE %TEMP%): mono-filen måste ligga där read_audio_file
+    // släpper igenom den när PR-4 laddar upp den. Egen katalog → cleanup_audio (DB-driven,
+    // rör bara recordings/) rör den aldrig.
+    let out_dir = app_data.join("diarize_temp");
+    std::fs::create_dir_all(&out_dir)
+        .map_err(|e| format!("Kunde inte skapa diarize_temp: {}", e))?;
+
+    // Självstädning: ta bort ev. kvarvarande mono-filer från en tidigare (kraschad) körning.
+    // PR-4 raderar normalt filen efter uppladdning; detta är reservnätet.
+    if let Ok(entries) = std::fs::read_dir(&out_dir) {
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if p.extension().and_then(|e| e.to_str()) == Some("wav") {
+                let _ = std::fs::remove_file(&p);
+            }
+        }
+    }
+
+    let timestamp = SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|e| e.to_string())?
+        .as_micros();
+    let out_path = out_dir.join(format!("meeting_{}.wav", timestamp));
+
+    // Tung fil-I/O (upp till ~880 MB läsning) får inte blockera main-tråden.
+    let out_path_worker = out_path.clone();
+    tauri::async_runtime::spawn_blocking(move || -> Result<(), String> {
+        let mut reader = hound::WavReader::open(&requested)
+            .map_err(|e| format!("Kunde inte öppna sessions-WAV: {}", e))?;
+        let spec = reader.spec();
+        if spec.channels != 2
+            || spec.bits_per_sample != 16
+            || spec.sample_format != hound::SampleFormat::Int
+        {
+            return Err(format!(
+                "Oväntat WAV-format (förväntade stereo 16-bit int): channels={}, bits={}, format={:?}",
+                spec.channels, spec.bits_per_sample, spec.sample_format
+            ));
+        }
+
+        let mono_spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: spec.sample_rate,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut writer = hound::WavWriter::create(&out_path_worker, mono_spec)
+            .map_err(|e| format!("Kunde inte skapa mono-WAV: {}", e))?;
+
+        // Interleavat L,R,L,R… → skriv varannat sampel med udda index (R = sys/MÖTET).
+        // Strömmar sampel för sampel via hounds buffrade läsare: konstant minne, aldrig
+        // hela filen i RAM.
+        for (i, sample) in reader.samples::<i16>().enumerate() {
+            let s = sample.map_err(|e| format!("Fel vid läsning av sampel: {}", e))?;
+            if i % 2 == 1 {
+                writer
+                    .write_sample(s)
+                    .map_err(|e| format!("Fel vid skrivning av sampel: {}", e))?;
+            }
+        }
+
+        writer
+            .finalize()
+            .map_err(|e| format!("Kunde inte finalisera mono-WAV: {}", e))?;
+        Ok(())
+    })
+    .await
+    .map_err(|e| format!("Kanalextraktion avbröts: {}", e))?
+    .map_err(|e| {
+        // Städa halvskriven utfil vid fel så nästa körning startar rent.
+        let _ = std::fs::remove_file(&out_path);
+        e
+    })?;
+
+    // Strippa \\?\-UNC-prefix (speglar session-complete-emitten) → JS får en ren sökväg.
+    let path_str = out_path.to_string_lossy().to_string();
+    let clean_path = match path_str.strip_prefix("\\\\?\\") {
+        Some(stripped) => stripped.to_string(),
+        None => path_str,
+    };
+    Ok(clean_path)
+}
+
+/// Raderar en extraherad mono-fil ur `app_data/diarize_temp/` efter att desktop-pipelinen
+/// laddat upp den till /diarize. Best-effort — fel loggas men kastar inte (self-cleanup i
+/// `extract_meeting_channel` städar reservvis vid nästa körning). Utan denna radering skulle
+/// den upp till ~440 MB stora MÖTET-kopian ligga kvar i app_data (utanför DB-gallringens
+/// `recordings/`) tills nästa inspelning — en lagrings- OCH integritetsfråga.
+///
+/// Vägrar sökvägar utanför `diarize_temp` (kan aldrig radera användarens inspelningar).
+/// JS anropar med camelCase-nyckel: `invoke("delete_diarize_temp", { path })`.
+#[tauri::command]
+pub async fn delete_diarize_temp(app: AppHandle, path: String) -> Result<(), String> {
+    let app_data = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| format!("Kunde inte bestämma datakatalog: {}", e))?;
+    let app_data = std::fs::canonicalize(&app_data)
+        .map_err(|e| format!("Kunde inte normalisera datakatalog: {}", e))?;
+    // Samma canonicaliserade bas som extract_meeting_channel skrev till → \\?\-prefixen matchar.
+    let diarize_dir = app_data.join("diarize_temp");
+
+    // canonicalize misslyckas om filen redan är borta → tolka som redan städat (idempotent).
+    let requested = match std::fs::canonicalize(&path) {
+        Ok(p) => p,
+        Err(_) => return Ok(()),
+    };
+    if !requested.starts_with(&diarize_dir) {
+        return Err("Åtkomst nekad: sökvägen ligger utanför diarize_temp.".to_string());
+    }
+    if let Err(e) = std::fs::remove_file(&requested) {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            eprintln!("Warning: kunde inte radera diarize-temp {:?}: {}", requested, e);
+        }
+    }
+    Ok(())
+}

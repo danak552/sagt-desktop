@@ -24,12 +24,24 @@ interface SyncState {
     // så ControlBar (alltid monterad) flushar bufferten till DB vid history-updated.
     pendingSpeakerData: { map: Record<string, string>; participants: string[] } | null;
 
+    // STEG 2 — live auto-namngivning under pågående (osparad) session. Sanningskälla för
+    // namn medan inspelningen pågår: den alltid-monterade hook:en (use-live-speaker-naming)
+    // SKRIVER hit, SplitView LÄSER för visning + skriver användarredigeringar. Ligger i den
+    // globala store:n — INTE i SplitView-state — så den överlever att SplitView avmonteras
+    // vid flikbyte. `liveAutoKeys` är provenance: vilka nycklar auto satt, så en manuell
+    // rename kan skydda sin nyckel mot framtida auto-överskrivning (användaren vinner alltid).
+    liveSpeakerMap: Record<string, string>;
+    liveAutoKeys: string[];
+
     // Smart Recording Journey states
     effectiveMode: 'cloud_analysis' | 'cloud' | 'local';
     isOnline: boolean;
 
     setActiveJob: (job: any | null, fromHistory?: boolean) => void;
     setPendingSpeakerData: (data: { map: Record<string, string>; participants: string[] } | null) => void;
+    setLiveSpeakerMap: (map: Record<string, string>) => void;
+    setLiveAutoKeys: (keys: string[]) => void;
+    clearLiveSpeakerData: () => void;
     setEffectiveMode: (mode: 'cloud_analysis' | 'cloud' | 'local') => void;
     setIsOnline: (status: boolean) => void;
     setUploadStatus: (status: 'idle' | 'uploading' | 'success' | 'error') => void;
@@ -69,6 +81,8 @@ export const useSyncStore = create<SyncState>((set) => ({
     activeJob: null,
     activeJobFromHistory: false,
     pendingSpeakerData: null,
+    liveSpeakerMap: {},
+    liveAutoKeys: [],
     effectiveMode: 'local', // Default, updated on mount/settings change
     isOnline: true,
 
@@ -93,6 +107,9 @@ export const useSyncStore = create<SyncState>((set) => ({
     setCloudStreamingActive: (val) => set({ cloudStreamingActive: val }),
     setActiveJob: (job, fromHistory = false) => set({ activeJob: job, activeJobFromHistory: fromHistory }),
     setPendingSpeakerData: (data) => set({ pendingSpeakerData: data }),
+    setLiveSpeakerMap: (map) => set({ liveSpeakerMap: map }),
+    setLiveAutoKeys: (keys) => set({ liveAutoKeys: keys }),
+    clearLiveSpeakerData: () => set({ liveSpeakerMap: {}, liveAutoKeys: [] }),
     reset: () => set({
         uploadedJobId: null,
         processingStatus: null,
@@ -105,6 +122,8 @@ export const useSyncStore = create<SyncState>((set) => ({
         activeJob: null,
         activeJobFromHistory: false,
         pendingSpeakerData: null,
+        liveSpeakerMap: {},
+        liveAutoKeys: [],
         analysisData: null,
         uploadedJobId: null,
         processingStatus: null,
@@ -123,5 +142,7 @@ export const useSyncStore = create<SyncState>((set) => ({
         activeJob: null,
         activeJobFromHistory: false,
         pendingSpeakerData: null,
+        liveSpeakerMap: {},
+        liveAutoKeys: [],
     }),
 }));

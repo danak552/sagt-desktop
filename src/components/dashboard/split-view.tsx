@@ -12,6 +12,7 @@ import { Button } from "@/components/ui/button";
 import { DropdownMenu, DropdownMenuTrigger, DropdownMenuContent, DropdownMenuItem, DropdownMenuSeparator } from "@/components/ui/dropdown-menu";
 import { getJob, reanalyzeTranscript, reanalyzeJob, uploadJob, identifySpeakers, SpeakerTurn, Job } from "@/lib/api";
 import { applyInlineCloudResult, cloudSegmentsJsonFromJob, segmentsHaveDiarizationLabels, invalidateStaleSpeakerMap, stripUnstableSpeakerMapKeys } from "@/lib/cloud-sync";
+import { speakerKey, mergeSuggestions, parseSpeakerData, serializeSpeakerData } from "@/lib/speaker-naming";
 import { AnalysisData } from "@/store/sync-store";
 import { useAuthStore, WAS_PRO_KEY } from "@/store/auth-store";
 import { toast } from "sonner";
@@ -65,7 +66,7 @@ export function SplitView() {
         uploadedJobId, setUploadedJobId, analysisData, setAnalysisData, processingStatus, setProcessingStatus,
         activeJob, activeJobFromHistory, setActiveJob, resetToLive, reset,
         setTemplateId, setUploadStatus, currentSessionPath, currentSessionId, setErrorMessage, isRecording,
-        effectiveMode, cloudStreamingActive
+        effectiveMode, cloudStreamingActive, liveSpeakerMap, liveAutoKeys
     } = useSyncStore();
     // Access store actions to populate segments for archive view
     const { setSegments, clearSegments } = useTranscriptionStore();
@@ -183,6 +184,10 @@ export function SplitView() {
     // Icke-förstörande — segmenten rörs aldrig, namnen appliceras ovanpå Du/Mötet i vyn.
     const [speakerMap, setSpeakerMap] = useState<Record<string, string>>({});
     const [participants, setParticipants] = useState<string[]>([]);
+    // STEG 2: provenance — vilka nycklar som satts av auto-namngivning (ej av användaren).
+    // Persisteras i speaker_map-payloaden (`auto`) och styr mergeSuggestions så en
+    // användarredigering aldrig skrivs över av en senare auto-körning.
+    const [autoKeys, setAutoKeys] = useState<string[]>([]);
     const [editingTurnIndex, setEditingTurnIndex] = useState<number | null>(null);
     const [editingName, setEditingName] = useState("");
     const [newParticipant, setNewParticipant] = useState("");
@@ -193,16 +198,16 @@ export function SplitView() {
     // avsiktligt). Utan detta skulle auto-kedjan merga ovanpå ett inaktuellt map.
     const speakerMapRef = useRef(speakerMap);
     const participantsRef = useRef(participants);
+    const autoKeysRef = useRef(autoKeys);
     useEffect(() => { speakerMapRef.current = speakerMap; }, [speakerMap]);
     useEffect(() => { participantsRef.current = participants; }, [participants]);
+    useEffect(() => { autoKeysRef.current = autoKeys; }, [autoKeys]);
     // §13.3: in-flight-guard för slå-ihop (popovern stängs synkront, men skyddar mot
     // blixtsnabb återöppning + nytt merge medan första invoken är i luften).
     const mergingRef = useRef(false);
 
-    // Kanonisk etikett: mic/DU → "DU", sys/MÖTET → "MÖTET" (segment kan bära endera formen).
-    // Mappning och hints nycklas på den kanoniska formen så de två varianterna inte splittras.
-    const speakerKey = (sp: string) =>
-        (sp === "mic" || sp === "DU") ? "DU" : (sp === "sys" || sp === "MÖTET") ? "MÖTET" : sp;
+    // Kanonisk etikett (mic/DU → "DU", sys/MÖTET → "MÖTET") importeras från speaker-naming.ts
+    // — delad med hook + libbet så de två varianterna aldrig splittras.
     const defaultLabel = (sp: string) => {
         const k = speakerKey(sp);
         if (k === "DU") return "Du";
@@ -366,9 +371,13 @@ export function SplitView() {
                 // och minne aldrig divergerar om kill switch är av och inga etiketter kom.
                 const hadDiar = segmentsHaveDiarizationLabels(cloudSegmentsJsonFromJob(job));
                 let baseMap = speakerMapRef.current;
+                let baseAuto = autoKeysRef.current;
                 if (hadDiar) {
                     baseMap = stripUnstableSpeakerMapKeys(baseMap);
+                    // Auto-provenance för bortstrippade (omnumrerade) nycklar är också inaktuell → filtrera.
+                    baseAuto = baseAuto.filter(k => k in baseMap);
                     setSpeakerMap(baseMap);
+                    setAutoKeys(baseAuto);
                 }
                 events.cloudSyncCompleted(wc);
                 setTranscriptView('cloud'); // visa det nya molnresultatet direkt
@@ -377,7 +386,7 @@ export function SplitView() {
                 // upp av sig själv när cues finns; annars står "Talare N" kvar. Pro/online-guard
                 // ligger i runIdentify. Turer byggs ur det FÄRSKA jobbet (inte den stale `turns`-memon).
                 if (hadDiar) {
-                    await runIdentify(turnsFromJob(job), participantsRef.current, baseMap, { silent: true });
+                    await runIdentify(turnsFromJob(job), participantsRef.current, baseMap, baseAuto, { silent: true });
                 }
             }
         } catch (error: any) {
@@ -399,29 +408,44 @@ export function SplitView() {
     // flushar den live-buffrade datan (pendingSpeakerData i store) vid history-updated, eftersom
     // SplitView kan vara avmonterad när lokal transkribering sparar inspelningen efter stopp.
     useEffect(() => {
-        if (!activeJob) { setSpeakerMap({}); setParticipants([]); return; }
+        if (!activeJob) { setSpeakerMap({}); setParticipants([]); setAutoKeys([]); return; }
         if (!useSyncStore.getState().activeJobFromHistory) return;
         const raw = activeJob.speaker_map;
-        if (!raw) { setSpeakerMap({}); setParticipants([]); return; }
-        try {
-            const parsed = JSON.parse(raw);
-            setSpeakerMap(parsed?.map && typeof parsed.map === 'object' ? parsed.map : {});
-            setParticipants(Array.isArray(parsed?.participants) ? parsed.participants : []);
-        } catch { setSpeakerMap({}); setParticipants([]); }
+        if (!raw) { setSpeakerMap({}); setParticipants([]); setAutoKeys([]); return; }
+        const parsed = parseSpeakerData(raw);
+        setSpeakerMap(parsed.map);
+        setParticipants(parsed.participants);
+        setAutoKeys(parsed.auto);
     // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [activeJob?.id, activeJob?.speaker_map]);
+
+    // STEG 2: under LIVE (inspelning pågår, ej ett historik-jobb) speglar SplitView store:ns
+    // liveSpeakerMap/liveAutoKeys — den alltid-monterade hook:en skriver namn dit och de dyker
+    // upp i vyn löpande. Gaten på isRecording: när inspelningen stoppar fryses den lokala
+    // staten som den är (flushen persisterar liveSpeakerMap till DB och nollställer live-fälten,
+    // så utan gaten skulle namnen försvinna ur vyn vid stopp).
+    useEffect(() => {
+        if (!isRecording || activeJobFromHistory) return;
+        setSpeakerMap(liveSpeakerMap);
+        setAutoKeys(liveAutoKeys);
+    }, [isRecording, activeJobFromHistory, liveSpeakerMap, liveAutoKeys]);
 
     // Persistera namnmappning + deltagarlista. SPARAD inspelning (id finns) → skriv direkt till
     // recordings.speaker_map. LIVE (inget id än) → buffra i global store; ControlBar flushar den
     // vid history-updated (alltid monterad → fungerar även när SplitView avmonterats vid flikbyte,
     // vilket händer i lokalt läge där inspelningen sparas asynkront efter stopp).
-    const persistSpeakerData = async (map: Record<string, string>, parts: string[]) => {
+    const persistSpeakerData = async (map: Record<string, string>, parts: string[], auto: string[] = autoKeysRef.current) => {
         const id = activeJob?.id ?? (currentSessionId ? parseInt(currentSessionId) : null);
         if (!id) {
-            useSyncStore.getState().setPendingSpeakerData({ map, participants: parts });
+            // LIVE: liveSpeakerMap/liveAutoKeys är sanningskällan (hook läser + flushen persisterar);
+            // participants buffras i pendingSpeakerData (flushen läser deltagarlistan därifrån).
+            const sync = useSyncStore.getState();
+            sync.setLiveSpeakerMap(map);
+            sync.setLiveAutoKeys(auto);
+            sync.setPendingSpeakerData({ map, participants: parts });
             return;
         }
-        const payload = JSON.stringify({ map, participants: parts });
+        const payload = serializeSpeakerData({ map, participants: parts, auto });
         try {
             // camelCase: Rust-param speaker_map → speakerMap i JS-invoke (annars None tyst).
             await invoke("save_speaker_map_to_db", { id, speakerMap: payload });
@@ -454,7 +478,11 @@ export function SplitView() {
         const next = { ...speakerMap };
         if (name) next[k] = name; else delete next[k];
         setSpeakerMap(next);
-        persistSpeakerData(next, participants);
+        // Användaren vinner: nyckeln blir användarsatt → bort ur auto-provenance så en
+        // framtida auto-körning aldrig skriver över den (mergeSuggestions-invarianten).
+        const nextAuto = autoKeys.filter(x => x !== k);
+        setAutoKeys(nextAuto);
+        persistSpeakerData(next, participants, nextAuto);
         cancelRename();
     };
 
@@ -506,7 +534,11 @@ export function SplitView() {
             delete nextMap[fromKey];
             if (fromName && !nextMap[toKey]) nextMap[toKey] = fromName;
             setSpeakerMap(nextMap);
-            await persistSpeakerData(nextMap, participants);
+            // Ihopslagning är ett medvetet användarval → både käll- och målnyckel blir användarsatta
+            // (bort ur auto-provenance) så auto-loopen inte återuppväcker den sammanslagna talaren.
+            const nextAuto = autoKeys.filter(x => x !== fromKey && x !== toKey);
+            setAutoKeys(nextAuto);
+            await persistSpeakerData(nextMap, participants, nextAuto);
             toast.success(`Slog ihop ${defaultLabel(fromSp)} med ${nextMap[toKey] || defaultLabel(toKey)}.`);
         } finally {
             mergingRef.current = false;
@@ -540,11 +572,14 @@ export function SplitView() {
 
     // §13.1: kärnan i talaridentifiering, delad av den manuella "Namnge talare igen" och
     // auto-kedjan. Icke-förstörande: mergar LLM-förslag ovanpå `baseMap` (turerna rörs aldrig).
+    // Provenance-styrt via `baseAuto` (mergeSuggestions): ett användarsatt namn skrivs ALDRIG
+    // över — bara osatta/auto-satta nycklar får förslaget (fixar dagens `{...baseMap,...suggested}`).
     // silent = auto-läget: dämpade toaster + fel sväljs (ska aldrig gnälla på användaren).
     const runIdentify = async (
         apiTurns: SpeakerTurn[],
         parts: string[],
         baseMap: Record<string, string>,
+        baseAuto: string[],
         opts: { silent?: boolean } = {},
     ) => {
         const silent = !!opts.silent;
@@ -561,14 +596,21 @@ export function SplitView() {
         try {
             const result = await identifySpeakers(apiTurns, parts, token);
             const suggested = result.speaker_map || {};
-            const count = Object.keys(suggested).length;
-            if (count === 0) {
+            if (Object.keys(suggested).length === 0) {
                 if (!silent) toast.info("Kunde inte härleda namn ur samtalet. Klicka på en etikett för att namnge manuellt.");
                 return;
             }
-            const next = { ...baseMap, ...suggested };
-            setSpeakerMap(next);
-            persistSpeakerData(next, parts);
+            const merged = mergeSuggestions(baseMap, suggested, baseAuto);
+            // Antal FAKTISKT applicerade namn (förslag mot användarsatta nycklar avvisas).
+            let count = 0;
+            for (const [k, v] of Object.entries(merged.map)) if (baseMap[k] !== v) count++;
+            if (count === 0) {
+                if (!silent) toast.info("Namnen är redan satta. Klicka på en etikett för att ändra manuellt.");
+                return;
+            }
+            setSpeakerMap(merged.map);
+            setAutoKeys(merged.autoKeys);
+            persistSpeakerData(merged.map, parts, merged.autoKeys);
             toast.success(
                 silent
                     ? `Namngav ${count} talare automatiskt. Klicka på ett namn för att ändra.`
@@ -594,7 +636,7 @@ export function SplitView() {
         const apiTurns: SpeakerTurn[] = turns
             .filter(t => t.speaker !== "MOLN")
             .map(t => ({ speaker: speakerKey(t.speaker), text: t.text, start: t.start_time ?? null }));
-        return runIdentify(apiTurns, participants, speakerMap, { silent: false });
+        return runIdentify(apiTurns, participants, speakerMap, autoKeys, { silent: false });
     };
 
     const handleAction = async () => {
@@ -913,6 +955,8 @@ export function SplitView() {
                                 if (invalidated) speakerMapRaw = invalidated;
                                 // Spegla invalideringen i in-memory-staten (se inline-vägen ovan).
                                 setSpeakerMap(prev => stripUnstableSpeakerMapKeys(prev));
+                                // Auto-provenance för omnumrerade nycklar är också inaktuell → filtrera.
+                                setAutoKeys(prev => prev.filter(k => k in stripUnstableSpeakerMapKeys(speakerMapRef.current)));
                             }
 
                             // Persist cloud_transcript + cloud_segments so segments survive tab switches
@@ -934,7 +978,8 @@ export function SplitView() {
                     // Guard: bara vid diarisering — Pro/online-kontrollen ligger i runIdentify.
                     if (segmentsHaveDiarizationLabels(cloudSegmentsJson)) {
                         const base = stripUnstableSpeakerMapKeys(speakerMapRef.current);
-                        await runIdentify(turnsFromJob(job), participantsRef.current, base, { silent: true });
+                        const baseAuto = autoKeysRef.current.filter(k => k in base);
+                        await runIdentify(turnsFromJob(job), participantsRef.current, base, baseAuto, { silent: true });
                     }
 
                     clearInterval(interval);

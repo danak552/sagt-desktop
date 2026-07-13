@@ -41,6 +41,10 @@ export function SettingsPage() {
         setPauseBreakMs,
         micIsSingleSpeaker,
         setMicIsSingleSpeaker,
+        autoDiarize,
+        setAutoDiarize,
+        autoAnalyze,
+        setAutoAnalyze,
         localAudioRetention,
         setLocalAudioRetention,
     } = useSettingsStore();
@@ -353,6 +357,61 @@ export function SettingsPage() {
                                                 key={String(value)}
                                                 onClick={() => setMicIsSingleSpeaker(value)}
                                                 className={`px-3 py-2 rounded-md border text-sm font-medium transition-all ${micIsSingleSpeaker === value
+                                                    ? 'border-primary bg-primary/5 text-primary ring-1 ring-primary'
+                                                    : 'border-line bg-white text-ink-soft hover:bg-paper-dim'
+                                                }`}
+                                            >
+                                                {label}
+                                            </button>
+                                        ))}
+                                    </div>
+                                </div>
+
+                                {/* §steg 5 — automatik efter möte (opt-out, default på) */}
+                                <div className="space-y-3 pt-1">
+                                    <div>
+                                        <label className="text-sm font-medium text-ink-soft">Automatisk talarseparering efter möte</label>
+                                        <p className="text-xs text-muted-foreground mt-1">
+                                            <strong>På</strong> (standard): Mötet-kanalen delas i Talare 1/2/3 automatiskt när du stoppar inspelningen.
+                                            <strong> Av</strong>: kör talarsepareringen manuellt via knappen i transkriptet.
+                                        </p>
+                                    </div>
+                                    <div className="grid grid-cols-2 gap-3">
+                                        {([
+                                            { value: true, label: '✅ På — automatiskt' },
+                                            { value: false, label: '✋ Av — manuellt' },
+                                        ] as { value: boolean; label: string }[]).map(({ value, label }) => (
+                                            <button
+                                                key={String(value)}
+                                                onClick={() => setAutoDiarize(value)}
+                                                className={`px-3 py-2 rounded-md border text-sm font-medium transition-all ${autoDiarize === value
+                                                    ? 'border-primary bg-primary/5 text-primary ring-1 ring-primary'
+                                                    : 'border-line bg-white text-ink-soft hover:bg-paper-dim'
+                                                }`}
+                                            >
+                                                {label}
+                                            </button>
+                                        ))}
+                                    </div>
+                                </div>
+
+                                <div className="space-y-3 pt-1">
+                                    <div>
+                                        <label className="text-sm font-medium text-ink-soft">Automatisk analys efter möte</label>
+                                        <p className="text-xs text-muted-foreground mt-1">
+                                            <strong>På</strong> (standard): AI-analysen (sammanfattning, beslut, åtgärder) startar automatiskt när du stoppar inspelningen i molnläge.
+                                            <strong> Av</strong>: starta analysen manuellt i transkriptet.
+                                        </p>
+                                    </div>
+                                    <div className="grid grid-cols-2 gap-3">
+                                        {([
+                                            { value: true, label: '✅ På — automatiskt' },
+                                            { value: false, label: '✋ Av — manuellt' },
+                                        ] as { value: boolean; label: string }[]).map(({ value, label }) => (
+                                            <button
+                                                key={String(value)}
+                                                onClick={() => setAutoAnalyze(value)}
+                                                className={`px-3 py-2 rounded-md border text-sm font-medium transition-all ${autoAnalyze === value
                                                     ? 'border-primary bg-primary/5 text-primary ring-1 ring-primary'
                                                     : 'border-line bg-white text-ink-soft hover:bg-paper-dim'
                                                 }`}

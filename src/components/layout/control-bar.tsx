@@ -9,12 +9,14 @@ import { toast } from "sonner";
 import { useSettingsStore } from "@/store/settings-store";
 // import { useRecordingStore } from "@/store/recording-store";
 import { useAuthStore } from "@/store/auth-store";
-import { uploadJob, reanalyzeTranscript } from "@/lib/api";
+import { uploadJob } from "@/lib/api";
 import { applyInlineCloudResult } from "@/lib/cloud-sync";
+import { serializeSpeakerData } from "@/lib/speaker-naming";
+import { finalizeStreamingSession } from "@/lib/auto-finalize";
 import { useSyncStore } from "@/store/sync-store";
 import { useTranscriptionStore } from "@/store/transcription-store";
 import { usePostHogEvents } from "@/hooks/use-posthog-events";
-import { waitForCloudStreamIdle, resetCloudStream } from "@/hooks/use-cloud-stream";
+import { resetCloudStream } from "@/hooks/use-cloud-stream";
 
 interface Recording {
     id: number | null;
@@ -44,7 +46,6 @@ export function ControlBar({ onViewChange }: ControlBarProps) {
         setErrorMessage,
         setSession,
         setActiveJob,
-        setAnalysisData,
         reset,
         isRecording, setIsRecording,
     } = useSyncStore();
@@ -112,13 +113,19 @@ export function ControlBar({ onViewChange }: ControlBarProps) {
                 // streaming-gren som return:ar nedan. Lokal transkribering sparar inspelningen
                 // asynkront efter stopp — ofta efter att användaren bytt flik (SplitView avmonterad)
                 // → SplitViews egen persistens hinner inte. ControlBar är alltid monterad.
+                // STEG 2: map:en kommer från liveSpeakerMap (sanningskälla under live — hook + SplitView
+                // skriver dit); participants från pendingSpeakerData; auto-provenance från liveAutoKeys
+                // så en användarredigering överlever återöppning och skyddas mot framtida auto.
                 {
-                    const pending = useSyncStore.getState().pendingSpeakerData;
-                    if (pending && (Object.keys(pending.map).length > 0 || pending.participants.length > 0)) {
+                    const st = useSyncStore.getState();
+                    const liveMap = st.liveSpeakerMap;
+                    const participants = st.pendingSpeakerData?.participants ?? [];
+                    if (Object.keys(liveMap).length > 0 || participants.length > 0) {
                         try {
-                            const payload = JSON.stringify({ map: pending.map, participants: pending.participants });
+                            const payload = serializeSpeakerData({ map: liveMap, participants, auto: st.liveAutoKeys });
                             await invoke("save_speaker_map_to_db", { id: recording.id, speakerMap: payload });
-                            useSyncStore.getState().setPendingSpeakerData(null);
+                            st.setPendingSpeakerData(null);
+                            st.clearLiveSpeakerData();
                             const aj = useSyncStore.getState().activeJob;
                             if (aj && aj.id === recording.id) {
                                 setActiveJob({ ...aj, speaker_map: payload }, useSyncStore.getState().activeJobFromHistory);
@@ -149,50 +156,16 @@ export function ControlBar({ onViewChange }: ControlBarProps) {
 
                 // PRO live-molnströmning: texten kom redan succesivt från molnet (Du/Mötet/MOLN).
                 // Ladda INTE upp hela filen igen — det skulle skriva över de strömmade segmenten
-                // med ett enda MOLN-stycke OCH kosta 2×. Kör bara analys om läget är cloud_analysis.
+                // med ett enda MOLN-stycke OCH kosta 2×. Post-stop-pipelinen (auto-finalize.ts)
+                // persisterar de strömmade segmenten och kör sedan auto-analys (§5) + auto-
+                // diarisering (§4) parallellt. Tyst degradering; texten är redan läsbar.
                 if (useSyncStore.getState().cloudStreamingActive) {
                     setUploadStatus('idle');
-                    try {
-                        // #6: vänta tills moln-kön dränerats så de sista chunkarna hinner in,
-                        // persistera sedan de strömmade segmenten till DB → historik/återöppning
-                        // visar samma Du/Mötet-vy, och vyn blankas inte vid stopp.
-                        useTranscriptionStore.getState().setIsProcessing(true);
-                        // 60 s: analysen ska köras på KOMPLETT text — eftersläpande chunks vid
-                        // mötesslut tar ofta >8 s att dränera (use-cloud-stream re-persisterar
-                        // dessutom vid varje äkta dränering som skyddsnät).
-                        await waitForCloudStreamIdle(60000);
-                        const segs = useTranscriptionStore.getState().segments;
-                        if (recording.id && segs.length > 0) {
-                            await invoke("update_recording_segments", {
-                                recordingId: recording.id,
-                                segments: segs.map(s => ({
-                                    start_time: s.start_time,
-                                    end_time: s.end_time,
-                                    text: s.text,
-                                    speaker: s.speaker,
-                                })),
-                            });
-                        }
-                        // Analys på den strömmade texten om läget är cloud_analysis.
-                        if (currentEffectiveMode === 'cloud_analysis' && segs.length > 0) {
-                            const token = getToken();
-                            if (token) {
-                                const fullText = segs.map(s => s.text).join(" ");
-                                const raw = await reanalyzeTranscript(fullText, "general", token);
-                                setAnalysisData({
-                                    summary: raw.summary || "",
-                                    decisions: raw.key_decisions || [],
-                                    actions: raw.action_items || [],
-                                    template_used: raw.template_used || "general",
-                                });
-                                events.analysisCompleted();
-                            }
-                        }
-                    } catch (e: any) {
-                        console.error("Streaming post-stop persist/analysis failed:", e);
-                    } finally {
-                        useTranscriptionStore.getState().setIsProcessing(false);
-                    }
+                    await finalizeStreamingSession({
+                        recording: { id: recording.id, file_path: recording.file_path },
+                        isCloudMode,
+                        token: getToken(),
+                    });
                     return;
                 }
 
@@ -253,7 +226,7 @@ export function ControlBar({ onViewChange }: ControlBarProps) {
         });
 
         return () => { unlistenPromise.then(f => f()); };
-    }, [setSession, setUploadStatus, setActiveJob, setUploadProgress, setErrorMessage, getToken, isPro, setAnalysisData]);
+    }, [setSession, setUploadStatus, setActiveJob, setUploadProgress, setErrorMessage, getToken, isPro]);
 
     const toggleRecording = async () => {
         try {
@@ -306,6 +279,7 @@ export function ControlBar({ onViewChange }: ControlBarProps) {
                 setSession(null, null);
                 reset(); // Clears uploadedJobId, processingStatus, analysisData, uploadStatus
                 useSyncStore.getState().setPendingSpeakerData(null); // nollställ talar-buffert för ny session
+                useSyncStore.getState().clearLiveSpeakerData(); // nollställ live-namn + auto-provenance
             }
         } catch (error: any) {
             console.error("Failed to toggle recording:", error);

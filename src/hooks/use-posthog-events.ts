@@ -17,14 +17,15 @@ export function usePostHogEvents() {
         transcriptionCompleted: (wordCount: number) =>
             captureEvent('transcription_completed', { word_count: wordCount }),
 
-        analysisRequested: () =>
-            captureEvent('analysis_requested'),
+        // source: 'manual' (SplitView-knappen) | 'auto_stop' (auto-analys vid stopp)
+        analysisRequested: (source: string = 'manual') =>
+            captureEvent('analysis_requested', { source }),
 
-        analysisCompleted: () =>
-            captureEvent('analysis_completed'),
+        analysisCompleted: (source: string = 'manual') =>
+            captureEvent('analysis_completed', { source }),
 
-        analysisFailed: (error: string) =>
-            captureEvent('analysis_failed', { error }),
+        analysisFailed: (error: string, source: string = 'manual') =>
+            captureEvent('analysis_failed', { error, source }),
 
         // Klient-intent; backend emitterar auktoritativa 'speakers_identified' vid lyckat svar.
         speakersIdentifyRequested: () =>

@@ -8,7 +8,8 @@
     "build": "tsc && vite build",
     "preview": "vite preview",
     "tauri": "tauri",
-    "tauri:dev": "tauri dev -- --features devtools"
+    "tauri:dev": "tauri dev -- --features devtools",
+    "test": "vitest run"
   },
   "dependencies": {
     "@fontsource/geist-sans": "^5.2.5",
@@ -51,6 +52,7 @@
     "tailwindcss": "^4.1.18",
     "tailwindcss-animate": "^1.0.7",
     "typescript": "~5.8.3",
-    "vite": "^7.0.4"
+    "vite": "^7.0.4",
+    "vitest": "^3.2.4"
   }
 }

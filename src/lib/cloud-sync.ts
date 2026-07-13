@@ -67,9 +67,14 @@ export async function invalidateStaleSpeakerMap(
     const map = parsed?.map && typeof parsed.map === "object" ? parsed.map : {};
     const kept = stripUnstableSpeakerMapKeys(map);
     if (Object.keys(kept).length === Object.keys(map).length) return null; // inget instabilt att strippa
+    // STEG 2: bevara auto-provenance men filtrera bort nycklar som strippades (deras auto-status
+    // är meningslös när namnet är borta) — annars skulle en auto-satt stabil nyckel felaktigt bli
+    // "användarsatt" (auto tomt ⇒ skyddad mot framtida auto-förfining).
+    const auto = Array.isArray(parsed?.auto) ? parsed.auto.filter((k: string) => k in kept) : [];
     const payload = JSON.stringify({
         map: kept,
         participants: Array.isArray(parsed?.participants) ? parsed.participants : [],
+        auto,
     });
     try {
         await invoke("save_speaker_map_to_db", { id: recordingDbId, speakerMap: payload });

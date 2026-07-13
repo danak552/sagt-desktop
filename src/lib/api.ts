@@ -361,3 +361,63 @@ export async function identifySpeakers(
 
     return await response.json();
 }
+
+// ─── Diarisering utan transkribering (STEG 4 — auto-diarisering vid stopp) ────
+/** En akustisk tur (ingen text) från MÖTET-kanalen. speaker = "MÖTET" (1 talare) eller
+ *  "MÖTET 1".."MÖTET N" (relabel_channel, §3.2); channel alltid "right". */
+export interface DiarizeTurn {
+    start: number;
+    end: number;
+    speaker: string;
+    channel: string;
+}
+
+/**
+ * POSTar MÖTET-kanalen (mono-WAV, extraherad i Rust) till /diarize (diarize-only, Pro-gatad
+ * under pro_router) → färdig-omdöpta akustiska turer. INGEN transkribering, INGEN kvot,
+ * INGET lagrat ljud (se app/api/diarize.py). Anroparen (auto-finalize) mappar turerna på de
+ * redan strömmade segmenten via `applyDiarizationTurns`.
+ *
+ * Läser filen via samma Rust-väg som `uploadJob` (`read_audio_file`), som är storlekstät på
+ * mono-MÖTET (≈110 MB/h). Kastar vid 401/402/413 + 503 (kill switch) så anroparen kan
+ * degradera tyst till DU/MÖTET. Speglar `identifySpeakers` felhantering.
+ */
+export async function diarizeMeeting(monoWavPath: string, token: string): Promise<DiarizeTurn[]> {
+    // 1. Läs mono-WAV via Rust (samma väg som uploadJob — vägrar sökvägar utanför app data).
+    let fileBytes: number[];
+    try {
+        fileBytes = await invoke<number[]>("read_audio_file", { path: monoWavPath });
+    } catch (error) {
+        throw new Error(`Kunde inte läsa mono-WAV: ${error}`);
+    }
+
+    const uint8 = new Uint8Array(fileBytes);
+    const file = new File([new Blob([uint8], { type: "audio/wav" })], "meeting.wav", { type: "audio/wav" });
+    const formData = new FormData();
+    formData.append("file", file);
+
+    const { backendUrl } = useSettingsStore.getState();
+    let baseUrl = backendUrl.replace(/\/$/, "");
+    if (!baseUrl.endsWith("/api/v1")) baseUrl = `${baseUrl}/api/v1`;
+    const url = `${baseUrl}/diarize`;
+
+    const response = await fetch(url, {
+        method: "POST",
+        headers: { "Authorization": `Bearer ${token}` },
+        body: formData,
+    });
+
+    if (!response.ok) {
+        const errText = await response.text();
+        let detail = errText;
+        try { const p = JSON.parse(errText); if (p.detail) detail = p.detail; } catch { }
+        if (response.status === 401) throw new Error(`Unauthorized: ${detail}`);
+        if (response.status === 402) throw new Error(`Payment Required: ${detail}`);
+        if (response.status === 413) throw new Error(`För stort: ${detail}`);
+        if (response.status === 503) throw new Error(`Otillgänglig: ${detail}`);
+        throw new Error(`Diarisering misslyckades: ${detail}`);
+    }
+
+    const data = await response.json();
+    return Array.isArray(data?.turns) ? data.turns : [];
+}
