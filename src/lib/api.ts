@@ -421,3 +421,68 @@ export async function diarizeMeeting(monoWavPath: string, token: string): Promis
     const data = await response.json();
     return Array.isArray(data?.turns) ? data.turns : [];
 }
+
+// ─── Live-diarisering session-broker (STEG 3 — pyannoteAI Live-1) ─────────────
+/** Svar från broker-mintningen. `granted:true` bär `id`+`url` (desktop ansluter ws:en
+ *  direkt); `granted:false` bär `reason` (kapacitet/kill switch → degradera tyst till
+ *  steg 4-batchen). Diskriminerad — spegla backend `LiveSessionResponse`. */
+export interface LiveSessionResponse {
+    granted: boolean;
+    id: string | null;
+    url: string | null;
+    reason: string | null;
+}
+
+/**
+ * Mintar en pyannote Live-1-session via brokern (`POST /live-diarize`, Pro-gatad). Brokern
+ * håller API-nyckeln server-side och returnerar bara den pre-signerade ws-URL:en. Kill switch
+ * av (503) → returnerar `{granted:false, reason:"disabled"}` (ett förväntat degraderingsläge,
+ * inte ett fel). Övriga icke-2xx → kastar så anroparen kan degradera tyst till batchen.
+ */
+export async function mintLiveSession(token: string): Promise<LiveSessionResponse> {
+    const { backendUrl } = useSettingsStore.getState();
+    let baseUrl = backendUrl.replace(/\/$/, "");
+    if (!baseUrl.endsWith("/api/v1")) baseUrl = `${baseUrl}/api/v1`;
+    const url = `${baseUrl}/live-diarize`;
+
+    const response = await fetch(url, {
+        method: "POST",
+        headers: { "Authorization": `Bearer ${token}` },
+    });
+
+    // 503 = kill switch av, 429 = anti-abuse-tak (delas med /jobs+/diarize) → båda är
+    // förväntade degraderingslägen (inte undantag). Klienten degraderar tyst till batchen;
+    // `reason` gör anledningen synlig i PostHog (live_diarize_degraded).
+    if (response.status === 503) return { granted: false, id: null, url: null, reason: "disabled" };
+    if (response.status === 429) return { granted: false, id: null, url: null, reason: "rate_limited" };
+
+    if (!response.ok) {
+        const errText = await response.text();
+        let detail = errText;
+        try { const p = JSON.parse(errText); if (p.detail) detail = p.detail; } catch { }
+        if (response.status === 401) throw new Error(`Unauthorized: ${detail}`);
+        if (response.status === 402) throw new Error(`Payment Required: ${detail}`);
+        throw new Error(`Live-mintning misslyckades: ${detail}`);
+    }
+
+    return await response.json();
+}
+
+/**
+ * Stämmer av en live-session efter ws-close (`GET /live-diarize/{id}`) → brokern frigör slotet
+ * om sessionen är terminal. Klienten kan inte nå pyannotes status själv (kräver API-nyckeln).
+ * Best-effort: fel sväljs av anroparen (slotet städas ändå av broker-liggarens stale-prune).
+ */
+export async function reconcileLiveSession(sessionId: string, token: string): Promise<{ status: string; active: boolean }> {
+    const { backendUrl } = useSettingsStore.getState();
+    let baseUrl = backendUrl.replace(/\/$/, "");
+    if (!baseUrl.endsWith("/api/v1")) baseUrl = `${baseUrl}/api/v1`;
+    const url = `${baseUrl}/live-diarize/${encodeURIComponent(sessionId)}`;
+
+    const response = await fetch(url, {
+        method: "GET",
+        headers: { "Authorization": `Bearer ${token}` },
+    });
+    if (!response.ok) throw new Error(`Live-reconcile misslyckades (${response.status}).`);
+    return await response.json();
+}

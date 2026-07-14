@@ -16,6 +16,7 @@ import { usePaymentRefresh } from "@/hooks/use-payment-refresh";
 import { useUpdater } from "@/hooks/use-updater";
 import { useCloudStream } from "@/hooks/use-cloud-stream";
 import { useLiveSpeakerNaming } from "@/hooks/use-live-speaker-naming";
+import { useLiveDiarize } from "@/hooks/use-live-diarize";
 import { runStorageCleanup, getStorageUsage, formatBytes, GB, type CleanupResult } from "@/lib/storage";
 import { useAuthStore } from "@/store/auth-store";
 import { MotdBanner } from "@/components/lifecycle/motd-banner";
@@ -27,6 +28,7 @@ function App() {
   useUpdater();
   useCloudStream();
   useLiveSpeakerNaming();
+  useLiveDiarize();
 
   const [currentView, setCurrentView] = useState<'dashboard' | 'settings' | 'recordings'>('dashboard');
   const isSignedIn = useAuthStore((s) => s.isSignedIn);

@@ -76,6 +76,11 @@ pub struct AudioSettings {
     /// Sammanhängande-läge (1×): mixa kanalerna och transkribera EN ström i molnet
     /// (talare "MOLN"). När false (Strukturerat) streamas varje kanal separat (DU/MÖTET, ~2×).
     pub merge_channels: bool,
+    /// Live-diarisering (STEG 3): när true emitteras MÖTET-kanalen som kontinuerlig
+    /// 16 kHz f32-ström (`live-diarize-pcm`, 100 ms-frames) till JS, som strömmar den
+    /// vidare till pyannoteAI Live-1. Sätts av JS FÖRST när en live-session mintats
+    /// (broker + LIVE_DIARIZE_ENABLED + Pro + online + structured) — annars av.
+    pub live_diarize: bool,
 }
 
 impl Default for AudioSettings {
@@ -86,6 +91,7 @@ impl Default for AudioSettings {
             language: "sv".to_string(),
             cloud_streaming: false,
             merge_channels: false,
+            live_diarize: false,
         }
     }
 }
@@ -113,6 +119,18 @@ struct CloudChunk {
     start: f64,       // seconds offset within the recording
     duration: f64,    // segmentets längd i sekunder → JS sätter end_time = start + duration
 }
+
+// Live-diarisering (STEG 3): en kontinuerlig 100 ms-bit av MÖTET-kanalen som rå 16 kHz
+// f32 (mono). JS bygger en Float32Array (pcm_f32le på x86/ARM) och strömmar den vidare
+// till pyannoteAI Live-1-ws:en. Kontinuerlig — inkl. tystnad — så pyannote får hela
+// tidslinjen; JS äger ws:en, sessionskedjan och relabelingen (PR-8).
+#[derive(Clone, Serialize)]
+struct LiveDiarizePcm {
+    samples: Vec<f32>,
+}
+
+// 100 ms @ 16 kHz mono = 1600 sampel = 6400 byte (pyannote Live-1:s chunk-storlek).
+const LIVE_DIARIZE_FRAME_SAMPLES: usize = 1600;
 
 enum AudioInput {
     Mic(f32),
@@ -183,6 +201,15 @@ impl AudioMonitor {
         s.cloud_streaming = cloud_streaming;
         s.merge_channels = merge_channels;
         println!("DEBUG: Cloud mode set: streaming={}, merge={}", cloud_streaming, merge_channels);
+    }
+
+    /// Live-diarisering (STEG 3): JS slår på detta när en pyannote Live-1-session mintats
+    /// (broker) och stänger av det vid stopp/degradering. På → MÖTET-kanalen emitteras som
+    /// `live-diarize-pcm`-frames. Ändrar inget annat i pipelinen (additivt bredvid cloud_streaming).
+    pub fn set_live_diarize(&self, enabled: bool) {
+        let mut s = self.settings.lock().unwrap();
+        s.live_diarize = enabled;
+        println!("DEBUG: Live-diarize mode set: {}", enabled);
     }
 
     pub fn get_input_devices(&self) -> Vec<AudioDevice> {
@@ -1125,7 +1152,11 @@ fn process_audio_stream(
     let mut silence_start = Instant::now();
     let mut count = 0;
     // input_buffer needs to be a ring buffer to handle variable chunk sizes from cpal safely
-    let mut input_buffer: VecDeque<f32> = VecDeque::with_capacity(input_chunk_size * 2); 
+    let mut input_buffer: VecDeque<f32> = VecDeque::with_capacity(input_chunk_size * 2);
+
+    // Live-diarisering (STEG 3): ackumulerar resamplad 16 kHz f32 till 100 ms-frames för
+    // MÖTET-kanalen. Bara sys-processorn fyller den (gate nedan) → mic-processorns förblir tom.
+    let mut live_frame_buffer: Vec<f32> = Vec::with_capacity(LIVE_DIARIZE_FRAME_SAMPLES * 2);
     
     // Talstart-tidsstämpel relativ till inspelningsstart (delad sessionsklocka, ms sedan epoch).
     // Båda kanalerna (mic/sys) jämförs mot samma session.start_time → korrekt ordning i vyn.
@@ -1213,10 +1244,28 @@ fn process_audio_stream(
                  }
 
                  // Read current settings (needed in both recording and flush paths)
-                 let (threshold, silence_duration, whisper_lang, cloud_streaming, merge_channels) = {
+                 let (threshold, silence_duration, whisper_lang, cloud_streaming, merge_channels, live_diarize) = {
                     let s = settings.lock().unwrap();
-                    (s.vad_threshold, s.silence_duration_ms as u128, s.language.clone(), s.cloud_streaming, s.merge_channels)
+                    (s.vad_threshold, s.silence_duration_ms as u128, s.language.clone(), s.cloud_streaming, s.merge_channels, s.live_diarize)
                  };
+
+                 // ── Live-diarisering (STEG 3): kontinuerlig MÖTET-ström till JS ──────────
+                 // Endast sys/MÖTET-kanalen, endast under inspelning och när live_diarize är på.
+                 // Emitterar 100 ms-frames (inkl. tystnad — pyannote behöver hela tidslinjen) i
+                 // takt med ljudinfångningen → aldrig snabbare än realtid. JS strömmar dem vidare
+                 // till Live-1-ws:en. Additivt: rör inte VAD/moln-vägen nedan.
+                 if live_diarize && source_label == "sys" && *is_recording.lock().unwrap() {
+                     live_frame_buffer.extend_from_slice(output_data);
+                     while live_frame_buffer.len() >= LIVE_DIARIZE_FRAME_SAMPLES {
+                         let frame: Vec<f32> =
+                             live_frame_buffer.drain(0..LIVE_DIARIZE_FRAME_SAMPLES).collect();
+                         let _ = app.emit("live-diarize-pcm", LiveDiarizePcm { samples: frame });
+                     }
+                 } else if !live_frame_buffer.is_empty() {
+                     // Live av / inspelning stoppad → släng residualsampel så nästa session
+                     // inte ärver en halv frame.
+                     live_frame_buffer.clear();
+                 }
 
                  // Gate VAD logic behind is_recording
                  if !*is_recording.lock().unwrap() {

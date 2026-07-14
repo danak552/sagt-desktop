@@ -94,6 +94,16 @@ fn set_cloud_mode(
     state.set_cloud_mode(cloud_streaming, merge_channels);
 }
 
+// Live-diarisering (STEG 3): JS slår på detta när en pyannote Live-1-session mintats och
+// stänger av det vid stopp/degradering. På → MÖTET-kanalen emitteras som `live-diarize-pcm`.
+#[tauri::command]
+fn set_live_diarize_mode(
+    state: tauri::State<'_, audio::AudioMonitor>,
+    enabled: bool,
+) {
+    state.set_live_diarize(enabled);
+}
+
 #[tauri::command]
 fn cancel_transcription(
     state: tauri::State<'_, TranscriptionProcess>,
@@ -316,6 +326,7 @@ pub fn run() {
             stop_audio_listener,
             update_audio_settings,
             set_cloud_mode,
+            set_live_diarize_mode,
             read_audio_file,
             cancel_transcription,
             save_recording_to_db,

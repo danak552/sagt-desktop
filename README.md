@@ -4,7 +4,7 @@
 
 [Download for Windows →](https://downloads.sagt.ai/Sagt.ai-setup.exe) | [sagt.ai](https://sagt.ai)
 
-**Current version: v0.9.39** — automatic speaker separation on stop (Beta, Pro): for streamed cloud recordings, speaker separation now runs by itself when you stop — no manual "re-transcribe" step. Two new layers: live speaker naming that names participants while the transcript grows during the meeting, and auto-diarization on stop that diarizes the meeting-channel audio in the EU (pyannoteAI, France — audio never leaves the EU) and maps the acoustic turns onto the already-streamed segments, then auto-names them. It runs alongside the auto-analysis and degrades silently to "You"/"Meeting" labels on any error, so the text is never blocked. Builds on v0.9.38's diarization UX (auto-naming, consolidated re-transcribe menu, merge speakers, mic-channel hint).
+**Current version: v0.9.40** — live speaker separation during the meeting (Beta, Pro): for streamed cloud recordings, individual speakers (Speaker 1/2/3) now emerge live within the meeting channel as people talk, via real-time diarization (pyannoteAI Live-1), on top of the automatic on-stop diarization shipped in v0.9.39. The on-stop batch pass still runs when you stop and remains the quality authority — it overwrites the provisional live labels with the higher-precision result. Everything degrades silently to "You"/"Meeting" labels on any error (network drop, capacity), so the transcript is never blocked. Pro-only; live streaming is metered per active meeting. Builds on v0.9.39's automatic on-stop speaker separation and v0.9.38's diarization UX.
 
 ![Sagt.ai Desktop — real-time Swedish transcription](assets/screenshot.png)
 
