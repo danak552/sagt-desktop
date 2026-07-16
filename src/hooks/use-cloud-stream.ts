@@ -5,8 +5,8 @@ import { useTranscriptionStore, UISegment } from "@/store/transcription-store";
 import { useAuthStore } from "@/store/auth-store";
 import { useSyncStore } from "@/store/sync-store";
 import { transcribeChunk } from "@/lib/api";
-import { toast } from "sonner";
 import posthog from "posthog-js";
+import { showError } from "@/hooks/use-posthog-events";
 
 // Matchar Rust `CloudChunk` (serde) — audio är WAV-bytes som number[].
 interface CloudChunkEvent {
@@ -148,9 +148,9 @@ export function useCloudStream() {
                 posthog?.capture?.("cloud_chunk_error", { speaker: chunk.speaker, message: msg.slice(0, 140) });
                 if (!errored) {
                     errored = true;
-                    if (msg.includes("Payment Required")) toast.error("Molntranskribering kräver aktiv Pro-prenumeration.");
-                    else if (msg.includes("Quota")) toast.error("Månadsgränsen för molntranskribering är nådd.");
-                    else toast.error("Molntranskribering avbröts (nätverk/server). Försöker igen automatiskt.", { duration: 6000 });
+                    if (msg.includes("Payment Required")) showError('not_pro', "Molntranskribering kräver aktiv Pro-prenumeration.", { action: 'cloud_stream' });
+                    else if (msg.includes("Quota")) showError('quota_exceeded', "Månadsgränsen för molntranskribering är nådd.", { action: 'cloud_stream' });
+                    else showError('unavailable', "Molntranskribering avbröts (nätverk/server). Försöker igen automatiskt.", { action: 'cloud_stream' }, { duration: 6000 });
                 }
             }
         };

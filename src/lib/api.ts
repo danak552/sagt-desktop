@@ -1,6 +1,10 @@
 import { invoke } from "@tauri-apps/api/core";
 import { useSettingsStore } from "@/store/settings-store";
 
+// Re-export så alla `import { errorSlug } from "@/lib/api"` fungerar; själva funktionen
+// bor i en ren fil utan Tauri-beroenden (error-slug.ts) → enhetstestbar i node.
+export { errorSlug } from "./error-slug";
+
 export interface Job {
     id: string;
     filename: string;

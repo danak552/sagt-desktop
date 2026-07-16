@@ -4,7 +4,9 @@
 
 [Download for Windows →](https://downloads.sagt.ai/Sagt.ai-setup.exe) | [sagt.ai](https://sagt.ai)
 
-**Current version: v0.9.40** — live speaker separation during the meeting (Beta, Pro): for streamed cloud recordings, individual speakers (Speaker 1/2/3) now emerge live within the meeting channel as people talk, via real-time diarization (pyannoteAI Live-1), on top of the automatic on-stop diarization shipped in v0.9.39. The on-stop batch pass still runs when you stop and remains the quality authority — it overwrites the provisional live labels with the higher-precision result. Everything degrades silently to "You"/"Meeting" labels on any error (network drop, capacity), so the transcript is never blocked. Pro-only; live streaming is metered per active meeting. Builds on v0.9.39's automatic on-stop speaker separation and v0.9.38's diarization UX.
+**Current version: v0.9.41** — error reporting. Nothing changes for you in this release: it adds an internal error signal so that when something breaks on your machine, we find out. Until now the desktop app had no error reporting at all, so a failed transcription was invisible to us unless someone wrote in. Errors are reported as a stable code (`network_error`, `unauthorized`, …) — never the error text, never your audio or transcript. See [Privacy](#privacy--what-leaves-your-machine), which we corrected in this release: it previously claimed the app makes zero network calls during local transcription, which was not true.
+
+**v0.9.40** — live speaker separation during the meeting (Beta, Pro): for streamed cloud recordings, individual speakers (Speaker 1/2/3) now emerge live within the meeting channel as people talk, via real-time diarization (pyannoteAI Live-1), on top of the automatic on-stop diarization shipped in v0.9.39. The on-stop batch pass still runs when you stop and remains the quality authority — it overwrites the provisional live labels with the higher-precision result. Everything degrades silently to "You"/"Meeting" labels on any error (network drop, capacity), so the transcript is never blocked. Pro-only; live streaming is metered per active meeting. Builds on v0.9.39's automatic on-stop speaker separation and v0.9.38's diarization UX.
 
 ![Sagt.ai Desktop — real-time Swedish transcription](assets/screenshot.png)
 
@@ -36,9 +38,21 @@
 
 KB-Whisper is trained by [Kungliga Biblioteket](https://kb.se) (the National Library of Sweden) on Swedish parliamentary debates, radio, and broadcast speech. It makes 3–8× fewer errors on Swedish names, dialects, and terminology compared to generic Whisper models.
 
-## Privacy — verifiable
+## Privacy — what leaves your machine
 
-During local transcription, the app makes zero external network calls. You can verify this yourself in Windows Task Manager → Resource Monitor → Network, or in any network monitoring tool. The source code for the audio pipeline is in [`src-tauri/src/audio.rs`](src-tauri/src/audio.rs).
+**In local mode, your audio and transcripts never leave your machine.** Recordings are transcribed on your own CPU by a bundled KB-Whisper model — nothing is uploaded, and there is no cloud round-trip. That is the promise that matters, and you can verify it yourself in Windows Task Manager → Resource Monitor → Network, or any network monitoring tool: no audio ever crosses the wire. The audio pipeline source is [`src-tauri/src/audio.rs`](src-tauri/src/audio.rs).
+
+The app is **not** network-silent, though, and we would rather say so plainly than have you discover it in Resource Monitor. It also:
+
+- **checks for updates** against [`downloads.sagt.ai/update-manifest.json`](https://downloads.sagt.ai/update-manifest.json),
+- **fetches app config** on startup (minimum supported version, maintenance status, message of the day),
+- **sends product analytics** to PostHog on EU servers — which events fired, on which app version, and a stable error code when something fails.
+
+Some of these fire *while a local transcription is running*: if local processing runs long, the app records that a Pro hint was shown, and any error you see is reported as an error code.
+
+**Analytics never carry audio, transcript text, or file names.** Error events send a stable slug such as `network_error` or `unauthorized` (see [`src/lib/error-slug.ts`](src/lib/error-slug.ts)) — never free-form error text, which could otherwise leak content. If you are signed in, these events are linked to your account rather than being anonymous.
+
+There is currently **no in-app switch to turn analytics off**. If that matters to you, [open an issue](../../issues) — it is a fair thing to ask for. Full details: [Privacy Policy](https://sagt.ai/integritetspolicy).
 
 ## Installation
 

@@ -1,9 +1,25 @@
 import posthog from 'posthog-js'
+import { toast } from 'sonner'
 
 const enabled = !!import.meta.env.VITE_POSTHOG_KEY
 
 export function captureEvent(event: string, props?: Record<string, unknown>) {
     if (enabled) posthog.capture(event, props)
+}
+
+/**
+ * Gemensam chokepoint för användarvända fel: visar toasten OCH fyrar ett generiskt
+ * `error_shown`-event med en stabil `code`-slug (härled via `errorSlug` i lib/api.ts).
+ * `code` grupperar i PostHog — skicka ALDRIG fri text/PII som grupperingsnyckel.
+ */
+export function showError(
+    code: string,
+    message: string,
+    props?: Record<string, unknown>,
+    toastOptions?: Parameters<typeof toast.error>[1],
+) {
+    toast.error(message, toastOptions)
+    captureEvent('error_shown', { surface: 'desktop', code, ...props })
 }
 
 export function usePostHogEvents() {

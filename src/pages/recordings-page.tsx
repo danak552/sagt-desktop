@@ -4,7 +4,8 @@ import { Cloud, CloudUpload, Trash2, FileAudio, FileText } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { useSyncStore } from "@/store/sync-store";
 import { useAuthStore } from "@/store/auth-store";
-import { uploadJob } from "@/lib/api";
+import { uploadJob, errorSlug } from "@/lib/api";
+import { showError } from "@/hooks/use-posthog-events";
 import { useState, useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
@@ -107,11 +108,11 @@ export function RecordingsPage({ onViewChange }: { onViewChange: (view: 'dashboa
         // Knappen döljs för gallrade rader, men raden kan vara stale om auto-gallring
         // hann köra efter senaste listladdning — ge tydligt fel i stället för filfel.
         if (rec.audio_deleted) {
-            toast.error("Ljudfilen är raderad — molnsynk kräver ljudet. Transkript och analys finns kvar.");
+            showError('audio_deleted', "Ljudfilen är raderad — molnsynk kräver ljudet. Transkript och analys finns kvar.", { action: 'cloud_sync' });
             return;
         }
         const token = getToken();
-        if (!token) { toast.error("Logga in för att synka till molnet."); return; }
+        if (!token) { showError('unauthorized', "Logga in för att synka till molnet.", { action: 'cloud_sync' }); return; }
         setSyncingId(rec.id);
         try {
             toast.info("Synkar till molnet...");
@@ -122,9 +123,9 @@ export function RecordingsPage({ onViewChange }: { onViewChange: (view: 'dashboa
             setRecordings(prev => prev.map(r => r.id === rec.id ? { ...r, sync_status: 'uploaded', cloud_job_id: job.id } : r));
             loadRecordings();
         } catch (err: any) {
-            if (err?.message?.includes("Payment Required")) toast.error("Molnsynk kräver Pro.");
-            else if (err?.message?.startsWith("Unauthorized")) toast.error("Din session är inte längre giltig. Logga in igen.");
-            else toast.error("Synk misslyckades: " + (err?.message || "okänt fel"));
+            if (err?.message?.includes("Payment Required")) showError('not_pro', "Molnsynk kräver Pro.", { action: 'cloud_sync' });
+            else if (err?.message?.startsWith("Unauthorized")) showError('unauthorized', "Din session är inte längre giltig. Logga in igen.", { action: 'cloud_sync' });
+            else showError(errorSlug(err), "Synk misslyckades: " + (err?.message || "okänt fel"), { action: 'cloud_sync' });
         } finally {
             setSyncingId(null);
         }

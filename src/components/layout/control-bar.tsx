@@ -9,13 +9,13 @@ import { toast } from "sonner";
 import { useSettingsStore } from "@/store/settings-store";
 // import { useRecordingStore } from "@/store/recording-store";
 import { useAuthStore } from "@/store/auth-store";
-import { uploadJob } from "@/lib/api";
+import { uploadJob, errorSlug } from "@/lib/api";
 import { applyInlineCloudResult } from "@/lib/cloud-sync";
 import { serializeSpeakerData } from "@/lib/speaker-naming";
 import { finalizeStreamingSession } from "@/lib/auto-finalize";
 import { useSyncStore } from "@/store/sync-store";
 import { useTranscriptionStore } from "@/store/transcription-store";
-import { usePostHogEvents } from "@/hooks/use-posthog-events";
+import { usePostHogEvents, showError } from "@/hooks/use-posthog-events";
 import { resetCloudStream } from "@/hooks/use-cloud-stream";
 
 interface Recording {
@@ -217,7 +217,7 @@ export function ControlBar({ onViewChange }: ControlBarProps) {
                         events.cloudSyncFailed(error?.message || 'unknown');
                         setUploadStatus('error');
                         setErrorMessage(error.message || "Ett okänt fel inträffade vid autosynk.");
-                        toast.error("Autosynk misslyckades: " + (error?.message || error?.toString() || "Okänt fel"));
+                        showError(errorSlug(error), "Autosynk misslyckades: " + (error?.message || error?.toString() || "Okänt fel"), { action: 'cloud_sync' });
                     }
                 } else if (isCloudMode && !isPro && isSignedIn) {
                     toast.warning("Molnläge kräver Pro. Inspelningen sparades lokalt.");
@@ -285,7 +285,7 @@ export function ControlBar({ onViewChange }: ControlBarProps) {
             console.error("Failed to toggle recording:", error);
             setIsRecording(false);
             setStartTime(null);
-            toast.error("Transkriberingsfel: " + (error?.message || error?.toString() || "Okänt fel"));
+            showError(errorSlug(error), "Transkriberingsfel: " + (error?.message || error?.toString() || "Okänt fel"), { action: 'transcription' });
         }
     };
 

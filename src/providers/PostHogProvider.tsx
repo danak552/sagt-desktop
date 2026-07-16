@@ -2,10 +2,10 @@ import { useEffect } from 'react'
 import posthog from 'posthog-js'
 import { useAuthStore } from '@/store/auth-store'
 import { captureEvent } from '@/hooks/use-posthog-events'
+import { CURRENT_VERSION } from '@/lib/version'
 
 const KEY = import.meta.env.VITE_POSTHOG_KEY as string | undefined
 const HOST = (import.meta.env.VITE_POSTHOG_HOST as string | undefined) ?? 'https://eu.i.posthog.com'
-const APP_VERSION = '0.9.40'
 
 if (KEY) {
     posthog.init(KEY, {
@@ -16,7 +16,7 @@ if (KEY) {
         autocapture: false,
         disable_session_recording: true,
         loaded: (ph) => {
-            ph.register({ platform: 'desktop', app_version: APP_VERSION })
+            ph.register({ platform: 'desktop', app_version: CURRENT_VERSION })
             ph.capture('app_opened')
         },
     })
@@ -47,7 +47,7 @@ export function PostHogProvider({ children }: { children: React.ReactNode }) {
                 captureEvent('sign_out')
                 posthog.reset()
                 // Re-register device super properties — reset() clears them
-                posthog.register({ platform: 'desktop', app_version: APP_VERSION })
+                posthog.register({ platform: 'desktop', app_version: CURRENT_VERSION })
             }
         })
     }, [])

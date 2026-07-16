@@ -10,7 +10,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { useEffect, useRef, useState, useMemo } from "react";
 import { Button } from "@/components/ui/button";
 import { DropdownMenu, DropdownMenuTrigger, DropdownMenuContent, DropdownMenuItem, DropdownMenuSeparator } from "@/components/ui/dropdown-menu";
-import { getJob, reanalyzeTranscript, reanalyzeJob, uploadJob, identifySpeakers, SpeakerTurn, Job } from "@/lib/api";
+import { getJob, reanalyzeTranscript, reanalyzeJob, uploadJob, identifySpeakers, SpeakerTurn, Job, errorSlug } from "@/lib/api";
 import { applyInlineCloudResult, cloudSegmentsJsonFromJob, segmentsHaveDiarizationLabels, invalidateStaleSpeakerMap, stripUnstableSpeakerMapKeys } from "@/lib/cloud-sync";
 import { speakerKey, mergeSuggestions, parseSpeakerData, serializeSpeakerData } from "@/lib/speaker-naming";
 import { AnalysisData } from "@/store/sync-store";
@@ -19,7 +19,7 @@ import { toast } from "sonner";
 import { ModePill } from "./mode-pill";
 import { UpsellModal } from "./upsell-modal";
 import { usePaymentRefresh } from "@/hooks/use-payment-refresh";
-import { usePostHogEvents } from "@/hooks/use-posthog-events";
+import { usePostHogEvents, showError, captureEvent } from "@/hooks/use-posthog-events";
 import { useSlowLocalHint } from "@/hooks/use-slow-local-hint";
 
 export function SplitView() {
@@ -394,9 +394,9 @@ export function SplitView() {
             setUploadedJobId(null);
             if (error?.message?.startsWith("Unauthorized")) {
                 clearSession();
-                toast.error("Din session är inte längre giltig. Logga in igen.");
+                showError('unauthorized', "Din session är inte längre giltig. Logga in igen.", { action: 'retranscribe' });
             } else {
-                toast.error("Uppladdning misslyckades: " + (error?.message || error?.toString() || "Okänt fel"));
+                showError(errorSlug(error), "Uppladdning misslyckades: " + (error?.message || error?.toString() || "Okänt fel"), { action: 'retranscribe' });
             }
         } finally {
             setIsRetranscribing(false);
@@ -620,11 +620,13 @@ export function SplitView() {
             if (silent) { console.warn("Auto-namngivning misslyckades:", error?.message || error); return; }
             if (error?.message?.startsWith("Unauthorized")) {
                 clearSession();
-                toast.error("Din session är inte längre giltig. Logga in igen.");
+                showError('unauthorized', "Din session är inte längre giltig. Logga in igen.", { action: 'identify_speakers' });
             } else if (error?.message?.includes("Payment Required")) {
+                // Visar upsell-modal i stället för toast → capture-only (ingen showError).
+                captureEvent('error_shown', { surface: 'desktop', code: 'not_pro', action: 'identify_speakers' });
                 setShowUpsellModal(true);
             } else {
-                toast.error("Talaridentifiering misslyckades: " + (error?.message || "Okänt fel"));
+                showError(errorSlug(error), "Talaridentifiering misslyckades: " + (error?.message || "Okänt fel"), { action: 'identify_speakers' });
             }
         } finally {
             setIsIdentifying(false);
