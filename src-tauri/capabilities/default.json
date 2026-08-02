@@ -8,6 +8,13 @@
   "permissions": [
     "core:default",
     "opener:default",
+    {
+      "identifier": "opener:allow-open-path",
+      "allow": [
+        { "path": "$APPDATA/recordings" },
+        { "path": "$APPDATA/recordings/**" }
+      ]
+    },
     "updater:allow-check",
     "updater:allow-download-and-install",
     "process:allow-restart",

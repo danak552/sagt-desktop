@@ -112,8 +112,7 @@ export function useCloudStream() {
             try {
                 const token = useAuthStore.getState().getToken();
                 if (!token) throw new Error("Ingen autentiseringstoken");
-                const limit = useAuthStore.getState().monthlyMinutesLimit;
-                const res = await transcribeChunk(chunk.audio, chunk.speaker, chunk.start, token, limit);
+                const res = await transcribeChunk(chunk.audio, chunk.speaker, chunk.start, token);
                 if (cancelRequested) return; // #11: avbrutet medan POST var i luften — släng resultatet
                 const text = (res.text || "").trim();
                 if (text) {

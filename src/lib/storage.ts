@@ -45,6 +45,35 @@ export async function getStorageUsage(): Promise<StorageUsage> {
     return invoke<StorageUsage>("get_storage_usage");
 }
 
+/**
+ * Öppnar inspelningskatalogen i Utforskaren. Kärnlöftet är att ljudet stannar på datorn —
+ * då ska användaren också kunna gå dit och se filerna, inte bara läsa en siffra i byte.
+ *
+ * Två vägar, i fallande ordning av hur bra resultatet blir:
+ *
+ *  1. `openPath` öppnar mappen direkt. Kräver BÅDE behörigheten `opener:allow-open-path`
+ *     OCH en scope-post för sökvägen i capabilities — pluginets `open_path` validerar
+ *     sökvägen mot ett scope och returnerar `ForbiddenPath` när tillåtelselistan är tom.
+ *     Behörigheten ensam räcker alltså inte; det var exakt felet i v0.9.43.
+ *  2. `revealItemInDir` som fallback. Den saknar scope-kontroll helt i pluginet och
+ *     ingår i `opener:default`, så den kan inte nekas — men den öppnar FÖRÄLDERN med
+ *     mappen markerad, alltså ett klick extra för användaren.
+ *
+ * Fallbacken finns för att scope-syntaxen ($APPDATA-upplösningen) bara går att verifiera
+ * i ett signerat CI-bygge. Hellre en knapp som alltid gör något vettigt än en som är död
+ * i ytterligare en releasecykel.
+ */
+export async function openRecordingsFolder(): Promise<void> {
+    const dir = await invoke<string>("get_recordings_dir");
+    const { openPath, revealItemInDir } = await import("@tauri-apps/plugin-opener");
+    try {
+        await openPath(dir);
+    } catch (e) {
+        console.warn("openPath nekades (scope?) — faller tillbaka på revealItemInDir:", e);
+        await revealItemInDir(dir);
+    }
+}
+
 /** Svensk formatering av bytes: "850 MB", "3,2 GB". */
 export function formatBytes(bytes: number): string {
     if (bytes >= GB) return `${(bytes / GB).toFixed(1).replace('.', ',')} GB`;

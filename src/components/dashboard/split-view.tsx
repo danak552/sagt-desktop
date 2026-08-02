@@ -22,6 +22,26 @@ import { usePaymentRefresh } from "@/hooks/use-payment-refresh";
 import { usePostHogEvents, showError, captureEvent } from "@/hooks/use-posthog-events";
 import { useSlowLocalHint } from "@/hooks/use-slow-local-hint";
 
+/**
+ * Enda statusindikatorn under pågående inspelning. Visas centrerad medan panelen är tom
+ * och glider sedan ned under texten när första segmentet landar — samma element hela
+ * vägen, så tillståndet aldrig byter visuellt språk mitt i inspelningen.
+ *
+ * Den säger medvetet INTE om transkriberingen sker lokalt eller i molnet: det ägs av
+ * ModePill i headern. Tidigare stod läget på tre ställen samtidigt.
+ */
+function ListeningIndicator() {
+    return (
+        <div className="flex items-center gap-2">
+            <span className="relative flex h-2 w-2">
+                <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-red-400 opacity-75" />
+                <span className="relative inline-flex rounded-full h-2 w-2 bg-red-500" />
+            </span>
+            <span className="text-xs text-ink-muted">Lyssnar…</span>
+        </div>
+    );
+}
+
 export function SplitView() {
     const isSignedIn = useAuthStore((s) => s.isSignedIn);
     const getToken = useAuthStore((s) => s.getToken);
@@ -70,7 +90,7 @@ export function SplitView() {
     } = useSyncStore();
     // Access store actions to populate segments for archive view
     const { setSegments, clearSegments } = useTranscriptionStore();
-    const { recordingMode, pauseBreakMs } = useSettingsStore();
+    const { recordingMode, pauseBreakMs, autoAnalyze } = useSettingsStore();
 
     // "Lokalt"-indikatorn ska bara visas som ÄKTA fallback — när molnet var avsett (Pro valde
     // moln) men inte är aktivt (offline) — aldrig när användaren medvetet valt lokalt läge.
@@ -1147,24 +1167,27 @@ export function SplitView() {
                         )}
 
                         {!activeJob && segments.length === 0 ? (
-                            <div className="flex flex-col items-center justify-center h-[50vh] text-center space-y-4 animate-in fade-in duration-1000">
-                                <>
-                                        <div className={`p-4 rounded-full bg-paper-dim ${isRecording ? "opacity-100" : "opacity-40"}`}>
-                                            <Sparkles className={`w-8 h-8 ${isRecording ? "text-red-400 animate-pulse" : "text-ink-muted"}`} />
+                            // Två skilda tillstånd, medvetet olika tyngd:
+                            //   Vilar  → panelen är genuint tom, ett block som säger vad man gör.
+                            //   Spelar in → något händer redan; då räcker samma diskreta rad som
+                            //     visas under texten så fort första segmentet landar. Läget
+                            //     (Moln/Lokal) ägs av ModePill i headern och upprepas inte här.
+                            <div className="flex flex-col items-center justify-center h-[50vh] text-center animate-in fade-in duration-1000">
+                                {isRecording ? (
+                                    <ListeningIndicator />
+                                ) : (
+                                    <div className="space-y-4 opacity-40">
+                                        <div className="p-4 rounded-full bg-paper-dim w-fit mx-auto">
+                                            <Sparkles className="w-8 h-8 text-ink-muted" />
                                         </div>
-                                        <div className={`space-y-1 ${isRecording ? "opacity-100" : "opacity-40"}`}>
-                                            <p className="text-ink font-medium">
-                                                {isRecording
-                                                    ? (cloudStreamingActive ? "🔴 Lyssnar — transkriberar i molnet..." : "🔴 Lyssnar — transkriberar lokalt...")
-                                                    : "Redo för mötet"}
-                                            </p>
+                                        <div className="space-y-1">
+                                            <p className="text-ink font-medium">Redo för mötet</p>
                                             <p className="text-sm text-ink-muted max-w-xs mx-auto">
-                                                {isRecording
-                                                    ? "Texten visas här om en liten stund."
-                                                    : "Starta inspelningen för att se transkribering i realtid."}
+                                                Starta inspelningen för att se transkribering i realtid.
                                             </p>
                                         </div>
-                                    </>
+                                    </div>
+                                )}
                             </div>
                         ) : isMerged ? (
                             // Sammanhängande (1×): ett flöde, styckesbryt vid pauser
@@ -1308,14 +1331,11 @@ export function SplitView() {
                                 })}
                             </div>
                         )}
-                        {/* Live Listening Indicator — shown at bottom of existing segments during recording */}
+                        {/* Samma element som visas i det tomma tillståndet — när första segmentet
+                            landar glider raden bara ned under texten i stället för att bytas ut. */}
                         {isRecording && segments.length > 0 && (
-                            <div className="flex items-center gap-2 pl-1 mt-2">
-                                <span className="relative flex h-2 w-2">
-                                    <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-red-400 opacity-75" />
-                                    <span className="relative inline-flex rounded-full h-2 w-2 bg-red-500" />
-                                </span>
-                                <span className="text-xs text-ink-muted">Lyssnar...</span>
+                            <div className="pl-1 mt-2">
+                                <ListeningIndicator />
                             </div>
                         )}
                         {/* Cloud Processing Indicator — shown while polling for Berget result */}
@@ -1571,10 +1591,19 @@ export function SplitView() {
                                         <div className="h-2 bg-paper-dim rounded w-full"></div>
                                         <div className="h-2 bg-paper-dim rounded w-5/6"></div>
                                     </div>
-                                    {/* #15: samma stil + copy-logik som vänstra panelens statustext (ej kursiv). */}
+                                    {/* Säger vad som gäller DENNA panel. Att upprepa "Transkriberar…"
+                                        här var tredje gången samma sak stod på skärmen samtidigt.
+
+                                        Löftet om AUTOMATISK start måste spegla samma villkor som
+                                        faktiskt driver den (auto-finalize.ts: isCloudMode &&
+                                        autoAnalyze). Vi gatar på cloudStreamingActive i stället för
+                                        recordingMode — molnläge med nedet nere degraderar till lokalt,
+                                        och då körs ingen finalizeStreamingSession. */}
                                     <p className="text-sm text-ink-muted pt-2 text-center">
                                         {isRecording
-                                            ? (cloudStreamingActive ? "Transkriberar i molnet..." : "Transkriberar lokalt...")
+                                            ? (cloudStreamingActive && autoAnalyze
+                                                ? "AI-analysen startar när du stoppar inspelningen."
+                                                : "AI-analysen kan startas när inspelningen är klar.")
                                             : "Starta inspelningen för att se transkribering i realtid."}
                                     </p>
                                 </>

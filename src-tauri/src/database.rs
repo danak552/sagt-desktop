@@ -439,6 +439,13 @@ impl DatabaseManager {
         Ok(())
     }
 
+    /// Sökvägen till inspelningskatalogen, för "Öppna mapp" i gränssnittet. Att bara visa
+    /// antal byte utan att kunna nå filerna gör det lokala löftet abstrakt — användaren
+    /// ska kunna se sina egna inspelningar i Utforskaren.
+    pub fn recordings_dir(&self) -> &PathBuf {
+        &self.recordings_dir
+    }
+
     /// Summera diskanvändningen: alla filer i recordings-katalogen + databasen
     /// (inkl. ev. -wal/-shm-sidofiler). Endast lokal filsystemåtkomst — offline-säkert.
     pub fn get_storage_usage(&self) -> Result<StorageUsage, String> {

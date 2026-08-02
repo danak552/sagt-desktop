@@ -1,7 +1,8 @@
 import { format } from "date-fns";
 import { sv } from "date-fns/locale";
-import { Cloud, CloudUpload, Trash2, FileAudio, FileText } from "lucide-react";
+import { Cloud, CloudUpload, Trash2, FileAudio, FileText, FolderOpen } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import { openRecordingsFolder } from "@/lib/storage";
 import { useSyncStore } from "@/store/sync-store";
 import { useAuthStore } from "@/store/auth-store";
 import { uploadJob, errorSlug } from "@/lib/api";
@@ -140,9 +141,23 @@ export function RecordingsPage({ onViewChange }: { onViewChange: (view: 'dashboa
 
     return (
         <div className="flex flex-col h-full bg-paper-dim overflow-y-auto">
-            <header className="px-8 py-6 border-b bg-white">
-                <h1 className="text-2xl font-bold tracking-tight text-ink">Inspelningar</h1>
-                <p className="text-muted-foreground mt-1">Dina lokala inspelningar och deras synk-status (SQLite Persisted).</p>
+            <header className="px-8 py-6 border-b bg-white flex items-start justify-between gap-4">
+                <div>
+                    <h1 className="text-2xl font-bold tracking-tight text-ink">Inspelningar</h1>
+                    <p className="text-muted-foreground mt-1">
+                        Inspelningar som ligger på den här datorn, med status för transkribering och molnsynk.
+                    </p>
+                </div>
+                <button
+                    onClick={() => openRecordingsFolder().catch((e) => {
+                        console.error("Kunde inte öppna inspelningsmappen:", e);
+                        toast.error("Kunde inte öppna mappen.");
+                    })}
+                    className="shrink-0 inline-flex items-center gap-1.5 text-sm text-brand hover:underline font-medium mt-1"
+                >
+                    <FolderOpen className="w-4 h-4" />
+                    Öppna mapp
+                </button>
             </header>
 
             <div className="p-8 max-w-6xl">
@@ -188,13 +203,16 @@ export function RecordingsPage({ onViewChange }: { onViewChange: (view: 'dashboa
                                                 {rec.audio_deleted ? (
                                                     <span
                                                         className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-xs font-medium bg-paper-dim text-ink-muted border border-line"
-                                                        title="Ljudfilen har gallrats — transkript och analys finns kvar"
+                                                        title="Ljudfilen finns inte längre på datorn — gallrad enligt din lagringspolicy, eller borttagen utanför appen. Transkript och analys påverkas inte."
                                                     >
                                                         <FileAudio className="w-3 h-3" />
-                                                        Raderad
+                                                        Saknas
                                                     </span>
                                                 ) : (
-                                                    <span className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-xs font-medium bg-verified/10 text-verified border border-verified/20">
+                                                    <span
+                                                        className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-xs font-medium bg-verified/10 text-verified border border-verified/20"
+                                                        title="Ljudfilen finns på den här datorn"
+                                                    >
                                                         <FileAudio className="w-3 h-3" />
                                                         Finns
                                                     </span>
@@ -204,14 +222,18 @@ export function RecordingsPage({ onViewChange }: { onViewChange: (view: 'dashboa
                                                 {rec.has_segments || rec.analysis_json ? (
                                                     <span
                                                         className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-xs font-medium bg-verified/10 text-verified border border-verified/20"
-                                                        title="Transkribering och analys finns kvar lokalt"
+                                                        title="Transkript och analys finns på den här datorn"
                                                     >
                                                         <FileText className="w-3 h-3" />
-                                                        Finns kvar
+                                                        Finns
                                                     </span>
                                                 ) : (
-                                                    <span className="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-paper-dim text-ink-muted border border-line">
-                                                        –
+                                                    <span
+                                                        className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-xs font-medium bg-paper-dim text-ink-muted border border-line"
+                                                        title="Ingen transkribering sparad för den här inspelningen"
+                                                    >
+                                                        <FileText className="w-3 h-3" />
+                                                        Saknas
                                                     </span>
                                                 )}
                                             </td>
@@ -227,15 +249,23 @@ export function RecordingsPage({ onViewChange }: { onViewChange: (view: 'dashboa
                                                         Synkad
                                                     </span>
                                                 ) : !rec.audio_deleted ? (
-                                                    <span className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-xs font-medium bg-ochre-soft text-ochre border border-ochre/20">
+                                                    <span
+                                                        className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-xs font-medium bg-ochre-soft text-ochre border border-ochre/20"
+                                                        title="Finns bara på den här datorn. Synka för att se den i dashboarden på sagt.ai."
+                                                    >
                                                         <CloudUpload className="w-3 h-3" />
                                                         Ej synkad
                                                     </span>
                                                 ) : (
-                                                    /* Gallrad och aldrig synkad: synk är omöjlig — visa neutral
-                                                       tomstatus istället för en "Ej synkad" som inte går att åtgärda. */
-                                                    <span className="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-paper-dim text-ink-muted border border-line">
-                                                        –
+                                                    /* Ljudfilen saknas och inspelningen synkades aldrig → synk är
+                                                       omöjlig. Ett blankt "–" tvingade användaren att gissa varför
+                                                       åtgärden inte fanns; säg orsaken i stället. */
+                                                    <span
+                                                        className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-xs font-medium bg-paper-dim text-ink-muted border border-line"
+                                                        title="Synk laddar upp ljudfilen, och den finns inte längre på datorn"
+                                                    >
+                                                        <Cloud className="w-3 h-3" />
+                                                        Kan inte synkas
                                                     </span>
                                                 )}
                                             </td>

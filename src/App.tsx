@@ -47,9 +47,18 @@ function App() {
     }
   }, [isSignedIn]);
 
+  // Bootstrap av ljudmotorn. Både mikrofonvalet OCH VAD-inställningarna måste pushas
+  // hit — Rust har egna defaults (tröskel 0.008, tystnad 800 ms) som annars gäller tills
+  // användaren råkar öppna Inställningar-fliken, där den enda andra anropspunkten låg.
+  // Effekten var tyst: en användare som ställt paustoleransen till 3 s fick 800 ms efter
+  // varje omstart, utan att gränssnittet visade något annat än 3 s.
   useEffect(() => {
     const state = useSettingsStore.getState();
     invoke("init_audio_engine", { device: state.inputDevice }).catch(console.error);
+    invoke("update_audio_settings", {
+      threshold: state.vadThreshold,
+      silenceMs: state.silenceDuration,
+    }).catch(console.error);
   }, []);
 
   // Auto-gallring av ljudfiler enligt vald policy: vid appstart och efter varje sparad
@@ -97,6 +106,20 @@ function App() {
     const unlistenPromise = listen<string>("audio-error", (event) => {
       console.error("Audio engine error:", event.payload);
       toast.error("Ljudfel: " + event.payload, { duration: 8000 });
+    });
+    return () => { unlistenPromise.then((f) => f()); };
+  }, []);
+
+  // Graciös degradering (lat mic): micen kunde inte öppnas vid inspelningsstart — oftast
+  // för att en annan app (webbmötet i webbläsaren, Teams/Zoom) håller den. Inspelningen
+  // avbryts INTE; den fortsätter med enbart mötesljudet (MÖTET/loopback). Informativt
+  // meddelande, inte ett fel — mötets övriga deltagare transkriberas ändå.
+  useEffect(() => {
+    const unlistenPromise = listen<string>("mic-unavailable", () => {
+      toast.info(
+        "Spelar in mötesljudet utan din egen mikrofonkanal — mikrofonen används av en annan app.",
+        { duration: 8000 }
+      );
     });
     return () => { unlistenPromise.then((f) => f()); };
   }, []);

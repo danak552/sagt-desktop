@@ -1,6 +1,13 @@
 [package]
 name = "sagt"
-version = "0.9.5"
+# Medvetet 0.0.0 — INTE appens version. tauri.conf.json:s `version` är sanningskällan
+# och vinner alltid när fältet finns där; detta fält läses varken av bundlern, av CI
+# eller av koden (inget env!("CARGO_PKG_VERSION") finns). Fältet stod tidigare på 0.9.5
+# medan appen var på 0.9.42, vilket bara gav "Compiling sagt v0.9.5" i byggloggarna och
+# fick folk att tro att versionerna glidit isär. Att i stället synka det manuellt hade
+# lagt till en fjärde fil att glömma vid varje bump — se desktop/CLAUDE.md om varför den
+# sortens duplicering redan orsakat tyst fel en gång (PostHogProvider).
+version = "0.0.0"
 description = "A Tauri App"
 authors = ["you"]
 edition = "2021"

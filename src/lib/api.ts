@@ -38,7 +38,6 @@ export async function transcribeChunk(
     speaker: string,
     start: number | null,
     token: string,
-    monthlyMinutesLimit?: number,
 ): Promise<ChunkResult> {
     const { backendUrl, transcriptionLanguage } = useSettingsStore.getState();
     let baseUrl = backendUrl.replace(/\/$/, "");
@@ -53,7 +52,8 @@ export async function transcribeChunk(
     formData.append("language", transcriptionLanguage ?? "sv");
     formData.append("speaker", speaker);
     if (start != null) formData.append("start", String(start));
-    if (monthlyMinutesLimit != null) formData.append("monthly_minutes_limit", String(monthlyMinutesLimit));
+    // Ingen monthly_minutes_limit här. Kvoten är ett auktorisationsbeslut och läses
+    // server-side ur Clerks public_metadata — en gräns klienten får föreslå är ingen gräns.
 
     const response = await fetch(url, {
         method: "POST",
@@ -379,7 +379,7 @@ export interface DiarizeTurn {
 /**
  * POSTar MÖTET-kanalen (mono-WAV, extraherad i Rust) till /diarize (diarize-only, Pro-gatad
  * under pro_router) → färdig-omdöpta akustiska turer. INGEN transkribering, INGEN kvot,
- * INGET lagrat ljud (se app/api/diarize.py). Anroparen (auto-finalize) mappar turerna på de
+ * INGET lagrat ljud. Anroparen (auto-finalize) mappar turerna på de
  * redan strömmade segmenten via `applyDiarizationTurns`.
  *
  * Läser filen via samma Rust-väg som `uploadJob` (`read_audio_file`), som är storlekstät på

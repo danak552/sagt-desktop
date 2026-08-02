@@ -63,6 +63,18 @@ fn stop_recording(
     state.stop_recording()
 }
 
+// Settings-mikrofontestet: håll micen öppen medan Inställningar visas, släpp vid lämning.
+// Tillsammans med is_recording avgör detta `mic_wanted` i motorloopens reconcile.
+#[tauri::command]
+fn start_mic_preview(state: tauri::State<'_, audio::AudioMonitor>) {
+    state.set_mic_preview(true);
+}
+
+#[tauri::command]
+fn stop_mic_preview(state: tauri::State<'_, audio::AudioMonitor>) {
+    state.set_mic_preview(false);
+}
+
 #[tauri::command]
 fn greet(name: &str) -> String {
     format!("Hello, {}! You've been greeted from Rust!", name)
@@ -75,14 +87,17 @@ fn stop_audio_listener(
     state.stop();
 }
 
+/// VAD-inställningarna bor i två världar: Zustand-persist i JS och `AudioSettings` här.
+/// JS är sanningskällan och MÅSTE pusha hit vid appstart — inte bara när Inställningar
+/// öppnas. Annars kör motorn sina egna defaults (800 ms) medan storen säger något annat.
+/// Inget `language` längre: den lokala sidecarn kör alltid svenska (se audio.rs).
 #[tauri::command]
 fn update_audio_settings(
     state: tauri::State<'_, audio::AudioMonitor>,
     threshold: f32,
     silence_ms: u64,
-    language: Option<String>,
 ) {
-    state.update_settings(threshold, silence_ms, language.unwrap_or_else(|| "sv".to_string()));
+    state.update_settings(threshold, silence_ms);
 }
 
 #[tauri::command]
@@ -263,6 +278,17 @@ fn get_storage_usage(
     db.get_storage_usage()
 }
 
+/// Sökvägen till inspelningskatalogen. JS öppnar den med plugin-opener så användaren kan
+/// se sina egna ljudfiler i Utforskaren — "ljudet stannar på din dator" ska gå att
+/// kontrollera, inte bara läsas.
+#[tauri::command]
+fn get_recordings_dir(
+    state: tauri::State<'_, Mutex<DatabaseManager>>,
+) -> Result<String, String> {
+    let db = state.lock().map_err(|e| e.to_string())?;
+    Ok(db.recordings_dir().to_string_lossy().to_string())
+}
+
 /// Auto-gallring av ljudfiler (äldst först). DB-rader med transkript/analys behålls
 /// och markeras audio_deleted. Anropas från JS med camelCase: maxAgeDays, maxTotalBytes.
 #[tauri::command]
@@ -321,8 +347,10 @@ pub fn run() {
             greet, 
             init_audio_engine, 
             get_audio_devices,
-            start_recording, 
-            stop_recording, 
+            start_recording,
+            stop_recording,
+            start_mic_preview,
+            stop_mic_preview,
             stop_audio_listener,
             update_audio_settings,
             set_cloud_mode,
@@ -340,6 +368,7 @@ pub fn run() {
             save_cloud_segments_to_db,
             save_speaker_map_to_db,
             get_storage_usage,
+            get_recordings_dir,
             cleanup_audio_storage,
             audio::extract_meeting_channel,
             audio::delete_diarize_temp

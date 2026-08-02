@@ -68,7 +68,6 @@ const CHUNK_LEAD_IN_SAMPLES: usize = (1.5 * SAMPLE_RATE as f32) as usize;
 pub struct AudioSettings {
     pub vad_threshold: f32,
     pub silence_duration_ms: u64,
-    pub language: String,
     /// PRO online: skicka VAD-segment till molnet (kb-whisper-large) istället för
     /// lokal whisper-cli. När true körs ALDRIG lokal small (offline-fallback sätter
     /// detta till false från JS).
@@ -88,7 +87,6 @@ impl Default for AudioSettings {
         Self {
             vad_threshold: VAD_THRESHOLD,
             silence_duration_ms: SILENCE_DURATION_MS as u64,
-            language: "sv".to_string(),
             cloud_streaming: false,
             merge_channels: false,
             live_diarize: false,
@@ -160,6 +158,10 @@ pub struct AudioMonitor {
     /// Önskad mic-enhet (None = systemets default). Sätts av init_audio_engine och
     /// plockas upp av huvudloopens 2 s-poll — enhetsbyte kräver ingen motoromstart.
     desired_mic: Arc<Mutex<Option<String>>>,
+    /// Settings-mikrofontestet begär öppen mic medan Inställningar visas. Tillsammans
+    /// med `is_recording` bildar detta `mic_wanted` — micen hålls öppen exakt när någon
+    /// av dem är sann, annars släpps den så andra appar kan använda mikrofonen.
+    mic_preview: Arc<Mutex<bool>>,
 }
 
 #[derive(Serialize)]
@@ -182,14 +184,14 @@ impl AudioMonitor {
                 duration_sec: 0.0,
             })),
             desired_mic: Arc::new(Mutex::new(None)),
+            mic_preview: Arc::new(Mutex::new(false)),
         }
     }
 
-    pub fn update_settings(&self, threshold: f32, silence_ms: u64, language: String) {
+    pub fn update_settings(&self, threshold: f32, silence_ms: u64) {
         let mut s = self.settings.lock().unwrap();
         s.vad_threshold = threshold;
         s.silence_duration_ms = silence_ms;
-        s.language = language;
         println!("DEBUG: Updated Audio Settings: {:?}", s);
     }
 
@@ -210,6 +212,13 @@ impl AudioMonitor {
         let mut s = self.settings.lock().unwrap();
         s.live_diarize = enabled;
         println!("DEBUG: Live-diarize mode set: {}", enabled);
+    }
+
+    /// Settings-mikrofontestet: sätt/nollställ önskan om öppen mic medan Inställningar
+    /// visas. Motorloopens reconcile bygger/dropper mic-strömmen mot `mic_wanted`.
+    pub fn set_mic_preview(&self, enabled: bool) {
+        *self.mic_preview.lock().unwrap() = enabled;
+        println!("DEBUG: Mic preview set: {}", enabled);
     }
 
     pub fn get_input_devices(&self) -> Vec<AudioDevice> {
@@ -245,23 +254,10 @@ impl AudioMonitor {
         let settings = self.settings.clone();
         let session_state = self.session_state.clone();
         let desired_mic = self.desired_mic.clone();
+        let mic_preview = self.mic_preview.clone();
 
         thread::spawn(move || {
             let host = cpal::default_host();
-
-            // Fail-loud helper: emit an `audio-error` event the UI can surface as a toast,
-            // RESET is_running so a later init_audio_engine retry actually restarts the engine
-            // (previously a panic here left is_running stuck `true` → engine silently dead),
-            // then exit the thread cleanly.
-            macro_rules! fail {
-                ($msg:expr) => {{
-                    let msg = $msg;
-                    eprintln!("AUDIO ERROR: {}", msg);
-                    let _ = app.emit("audio-error", msg);
-                    *is_running.lock().unwrap() = false;
-                    return
-                }};
-            }
 
             // Channel for aggregating VAD levels
             let (level_tx, level_rx) = unbounded::<AudioInput>();
@@ -280,18 +276,14 @@ impl AudioMonitor {
                 start_session_recorder(session_rx, app_handle_recorder, is_running_recorder, is_recording_recorder, session_state_recorder, settings_recorder);
             });
 
-            // --- Microphone Capture ---
-            // Fail-loud vid motorstart: ingen mic alls → audio-error + motorn dör (en
-            // senare init_audio_engine försöker igen). Därefter sköts enhetsbyten,
-            // WASAPI-invalidering och självläkning av mic-rebind i huvudloopen nedan.
-            let initial_mic = desired_mic.lock().unwrap().clone();
-            let mut mic_capture = match build_mic_capture(
-                &host, &app, &level_tx, &session_tx, &settings, &is_recording, &session_state,
-                initial_mic,
-            ) {
-                Ok(c) => Some(c),
-                Err(e) => fail!(e),
-            };
+            // --- Microphone Capture (LAT) ---
+            // Micen öppnas INTE vid motorstart. Reconcilen i huvudloopen nedan bygger
+            // den on-demand när `mic_wanted` (inspelning ELLER Settings-mikrofontest) blir
+            // sann, och släpper den annars. Så länge appen bara ligger öppen hålls micen
+            // INTE → andra appar (webbläsarens inspelning, Teams/Zoom) kan använda den fritt.
+            // Saknad mic dödar därmed inte längre motorn; den ytar graciöst vid inspelnings-
+            // start (degradering till MÖTET-only, se reconcile-grenen).
+            let mut mic_capture: Option<MicCapture> = None;
 
             // --- System Loopback Capture ---
             // Loopbacken binds mot den AKTUELLA default-utgången och binds om i huvud-
@@ -327,6 +319,12 @@ impl AudioMonitor {
              // Engångstoast per mic-felepisod (nollställs vid lyckad rebind) —
              // fail-loud utan att spamma en toast var 2 s medan enheten saknas.
              let mut mic_error_emitted = false;
+             // Retry-throttle för reconcilens mic-bygge: reconcilen kör varje loop-varv
+             // (~20 ms), så utan detta skulle ett misslyckat bygge (t.ex. micen upptagen
+             // under loopback-only) retry-loopa enhetsenumereringen 50+ ggr/s. None =
+             // "försök direkt" (låg latens vid inspelningsstart); efter ett försök väntar
+             // vi ≥ 2 s. Nollställs vid lyckat bygge och vid mic-släpp → nästa episod är direkt.
+             let mut last_mic_build_attempt: Option<Instant> = None;
 
              // --- Follow-the-audio-state (se SysTarget för designmotiv) ---
              let mut sys_target = SysTarget::Default;
@@ -351,6 +349,76 @@ impl AudioMonitor {
              loop {
                 if !*is_running.lock().unwrap() {
                     break;
+                }
+
+                // --- Lat mic-livscykel: håll mic-INPUT öppen bara när den behövs ---
+                // mic_wanted = aktiv inspelning ELLER Settings-mikrofontest (mic_preview).
+                // Detta är ENDA stället som BYGGER mic-strömmen från None — 2s-pollen nedan
+                // droppar bara en ström som behöver bytas och låter reconcilen bygga om inom
+                // en ~20ms-tick. Loopbacken (MÖTET) och session-recordern rörs aldrig.
+                {
+                    let mic_wanted =
+                        *is_recording.lock().unwrap() || *mic_preview.lock().unwrap();
+                    if mic_wanted {
+                        // Throttla bygg-försöket: direkt första gången (None), därefter ≥ 2 s
+                        // mellan misslyckade försök så en upptagen mic inte retry-loopar hett
+                        // (reconcilen kör varje ~20ms-varv).
+                        let may_try_build = mic_capture.is_none()
+                            && last_mic_build_attempt
+                                .map_or(true, |t| t.elapsed() >= Duration::from_secs(2));
+                        if may_try_build {
+                            last_mic_build_attempt = Some(Instant::now());
+                            let desired = desired_mic.lock().unwrap().clone();
+                            match build_mic_capture(
+                                &host, &app, &level_tx, &session_tx, &settings, &is_recording,
+                                &session_state, desired,
+                            ) {
+                                Ok(cap) => {
+                                    println!("DEBUG: Mic opened lazily on {:?}", cap.device_name);
+                                    mic_capture = Some(cap);
+                                    mic_error_emitted = false;
+                                    last_mic_build_attempt = None;
+                                }
+                                Err(e) => {
+                                    // Micen kunde inte öppnas. UNDER INSPELNING är detta den
+                                    // graciösa degraderingen till MÖTET-only (t.ex. micen hålls
+                                    // av ett webbmöte): inspelningen fortsätter, vi visar ett
+                                    // INFORMATIVT `mic-unavailable`-event — aldrig den röda
+                                    // "Mikrofonfel"-toasten. Utanför inspelning (bara preview)
+                                    // är det ett vanligt mic-fel. Engångs per episod.
+                                    if !mic_error_emitted {
+                                        mic_error_emitted = true;
+                                        if *is_recording.lock().unwrap() {
+                                            eprintln!(
+                                                "AUDIO: mic otillgänglig — degraderar till MÖTET-only: {}",
+                                                e
+                                            );
+                                            let _ = app.emit("mic-unavailable", e);
+                                        } else {
+                                            let _ = app.emit("audio-error", format!("Mikrofonfel: {}", e));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        // Micen är inte önskad. Släpp en ev. öppen ström → sample-kanalen
+                        // kopplas ner, processor-tråden avslutas och force-flushar ev. pågående
+                        // DU-segment. Släpper micen för andra appar.
+                        if mic_capture.is_some() {
+                            println!("DEBUG: Mic released (viloläge — ej inspelning/preview)");
+                            mic_capture = None;
+                            current_mic = 0.0;
+                        }
+                        // Nollställ felstate OVILLKORLIGT på viloläge-kanten så nästa episod
+                        // börjar rent — även efter en loopback-only-inspelning där micen
+                        // ALDRIG byggdes (mic_capture var None hela tiden). Annars skulle
+                        // mic_error_emitted/last_mic_build_attempt läcka vidare: en andra
+                        // degraderad inspelning i rad fick ingen mic-unavailable-toast, och
+                        // en snabb stopp/start kunde fördröja första mic-försöket upp till 2 s.
+                        mic_error_emitted = false;
+                        last_mic_build_attempt = None;
+                    }
                 }
 
                 // Use a shorter timeout to stay responsive but drain messages
@@ -472,14 +540,16 @@ impl AudioMonitor {
                     // Ett låstag per poll — läses av unpin-invarianten och guardrailen.
                     let recording_now = *is_recording.lock().unwrap();
 
-                    // --- Mic-rebind: enhetsbyte i Inställningar (desired ändrad), WASAPI-
-                    // invalidering (failed-flaggan), default-mic-byte när "Standardenhet"
-                    // är vald, eller självläkning när vald/någon mic dyker upp igen.
-                    // Samma mönster som loopback-rebinden nedan, men fail-loud: misslyckad
-                    // rebind → audio-error-toast; motorn lever vidare och försöker var 2 s.
-                    let desired = desired_mic.lock().unwrap().clone();
+                    // --- Mic-rebind (endast DROP): enhetsbyte i Inställningar (desired
+                    // ändrad), WASAPI-invalidering (failed-flaggan), default-mic-byte när
+                    // "Standardenhet" är vald, eller självläkning när vald mic dyker upp igen.
+                    // Vi DROPPAR bara den befintliga strömmen här; reconcilen i loopens topp
+                    // äger (åter)byggnaden mot `desired` och bygger om inom en ~20ms-tick
+                    // (R3 — ett enda byggställe + en felväg). None => ingen åtgärd: micen är
+                    // antingen inte önskad, eller så bygger reconcilen den redan.
                     let mic_needs_rebind = match &mic_capture {
                         Some(cap) => {
+                            let desired = desired_mic.lock().unwrap().clone();
                             cap.failed.load(Ordering::SeqCst)
                                 || cap.requested != desired
                                 || match &desired {
@@ -492,37 +562,21 @@ impl AudioMonitor {
                                         && input_device_exists(&host, name),
                                 }
                         }
-                        None => true,
+                        None => false,
                     };
                     if mic_needs_rebind {
                         if let Some(cap) = mic_capture.take() {
                             println!(
-                                "DEBUG: Rebinding mic (failed={}, old={:?}, desired={:?})",
-                                cap.failed.load(Ordering::SeqCst), cap.device_name, desired
+                                "DEBUG: Dropping mic for rebind (failed={}, old={:?})",
+                                cap.failed.load(Ordering::SeqCst), cap.device_name
                             );
                             // Droppa gamla strömmen FÖRST — aldrig två aktiva mic-strömmar.
                             // Nedkopplad sample-kanal avslutar gamla processor-tråden, som
-                            // force-flushar sitt pågående VAD-segment.
+                            // force-flushar sitt pågående VAD-segment. Reconcilen bygger om
+                            // mot aktuell `desired` nästa varv.
                             drop(cap);
                         }
                         current_mic = 0.0;
-                        match build_mic_capture(
-                            &host, &app, &level_tx, &session_tx, &settings, &is_recording, &session_state,
-                            desired,
-                        ) {
-                            Ok(cap) => {
-                                println!("DEBUG: Mic rebound to {:?}", cap.device_name);
-                                mic_capture = Some(cap);
-                                mic_error_emitted = false;
-                            }
-                            Err(e) => {
-                                eprintln!("AUDIO ERROR: mic rebind failed: {}", e);
-                                if !mic_error_emitted {
-                                    mic_error_emitted = true;
-                                    let _ = app.emit("audio-error", format!("Mikrofonfel: {}", e));
-                                }
-                            }
-                        }
                     }
 
                     // Rebind-beslut per target-läge:
@@ -1244,9 +1298,9 @@ fn process_audio_stream(
                  }
 
                  // Read current settings (needed in both recording and flush paths)
-                 let (threshold, silence_duration, whisper_lang, cloud_streaming, merge_channels, live_diarize) = {
+                 let (threshold, silence_duration, cloud_streaming, merge_channels, live_diarize) = {
                     let s = settings.lock().unwrap();
-                    (s.vad_threshold, s.silence_duration_ms as u128, s.language.clone(), s.cloud_streaming, s.merge_channels, s.live_diarize)
+                    (s.vad_threshold, s.silence_duration_ms as u128, s.cloud_streaming, s.merge_channels, s.live_diarize)
                  };
 
                  // ── Live-diarisering (STEG 3): kontinuerlig MÖTET-ström till JS ──────────
@@ -1276,7 +1330,7 @@ fn process_audio_stream(
                          if duration_ms > 100 { // Only flush if meaningful data (>0.1s)
                             println!("DEBUG: Recording stopped, flushing pending speech buffer on {} ({}ms)", source_label, duration_ms);
                             let start_offset = session_offset(&session_state, speech_start_ms);
-                            dispatch_segment(&speech_buffer, source_label, &app, session_state.clone(), start_offset, whisper_lang.clone(), cloud_streaming, merge_channels);
+                            dispatch_segment(&speech_buffer, source_label, &app, session_state.clone(), start_offset, cloud_streaming, merge_channels);
                          } else {
                             println!("DEBUG: Recording stopped, dropping short buffer on {} ({}ms)", source_label, duration_ms);
                          }
@@ -1364,7 +1418,7 @@ fn process_audio_stream(
                                 // Check minimum recording duration (sanity check, keeping 1s limit)
                                 if duration_ms > MIN_RECORDING_DURATION_MS {
                                     let start_offset = session_offset(&session_state, speech_start_ms);
-                                    dispatch_segment(&speech_buffer, source_label, &app, session_state.clone(), start_offset, whisper_lang.clone(), cloud_streaming, merge_channels);
+                                    dispatch_segment(&speech_buffer, source_label, &app, session_state.clone(), start_offset, cloud_streaming, merge_channels);
                                 } else {
                                     println!("DEBUG: Ignoring short speech segment (< {}ms) on {}", MIN_RECORDING_DURATION_MS, source_label);
                                 }
@@ -1381,7 +1435,7 @@ fn process_audio_stream(
                          if current_dur > max_dur {
                              println!("DEBUG: Max segment length reached ({}ms) on {}. Forcing flush.", current_dur, source_label);
                              let start_offset = session_offset(&session_state, speech_start_ms);
-                             dispatch_segment(&speech_buffer, source_label, &app, session_state.clone(), start_offset, whisper_lang.clone(), cloud_streaming, merge_channels);
+                             dispatch_segment(&speech_buffer, source_label, &app, session_state.clone(), start_offset, cloud_streaming, merge_channels);
                              // Behåll en kort lead-in (slutet av segmentet) så whisper inte tappar
                              // de första orden i nästa chunk vid abrupt klippstart.
                              let lead = speech_buffer.len().saturating_sub(CHUNK_LEAD_IN_SAMPLES);
@@ -1428,11 +1482,11 @@ fn process_audio_stream(
         if duration_ms > 500 { // Minimal sanity check for force flush
             println!("DEBUG: Force flushing speech buffer on {} (Duration: {}ms)", source_label, duration_ms);
             let start_offset = session_offset(&session_state, speech_start_ms);
-            let (whisper_lang, cloud_streaming, merge_channels) = {
+            let (cloud_streaming, merge_channels) = {
                 let s = settings.lock().unwrap();
-                (s.language.clone(), s.cloud_streaming, s.merge_channels)
+                (s.cloud_streaming, s.merge_channels)
             };
-            dispatch_segment(&speech_buffer, source_label, &app, session_state.clone(), start_offset, whisper_lang, cloud_streaming, merge_channels);
+            dispatch_segment(&speech_buffer, source_label, &app, session_state.clone(), start_offset, cloud_streaming, merge_channels);
         }
     }
 }
@@ -1440,15 +1494,16 @@ fn process_audio_stream(
 /// Routes a finished VAD speech segment to the right transcriber:
 /// - cloud_streaming + merge_channels → no-op here (the session recorder emits the mixed
 ///   "MOLN" stream so we don't pay 2× by also streaming each channel).
-/// - cloud_streaming → ship the segment to the cloud (kb-whisper-large), tagged DU/MÖTET.
-/// - otherwise → local whisper-cli (FREE tier / offline fallback), unchanged behaviour.
+/// - cloud_streaming → ship the segment to the cloud, tagged DU/MÖTET. Språket följer med
+///   POSTen från JS (api.ts), inte härifrån — molnet väljer talmodell per språk.
+/// - otherwise → local whisper-cli (FREE tier / offline fallback). Alltid svenska, se
+///   `transcribe`.
 fn dispatch_segment(
     data: &[f32],
     source: &str,
     app: &AppHandle,
     session_state: Arc<Mutex<SessionState>>,
     start_offset: f64,
-    language: String,
     cloud_streaming: bool,
     merge_channels: bool,
 ) {
@@ -1458,7 +1513,7 @@ fn dispatch_segment(
         }
         emit_cloud_chunk(data, source, app, start_offset);
     } else {
-        transcribe(data, source, app, session_state, start_offset, language);
+        transcribe(data, source, app, session_state, start_offset);
     }
 }
 
@@ -1504,13 +1559,18 @@ fn emit_cloud_chunk(data: &[f32], source: &str, app: &AppHandle, start_offset: f
     });
 }
 
+/// Lokal transkribering via whisper-cli-sidecarn. Alltid svenska: den enda modell som
+/// paketeras är `ggml-kb-whisper-small.bin`, KB:s SVENSKA finetune. Att skicka `-l no`
+/// eller `-l en` till den gav en svensk modell som låtsades läsa ett annat språk — tyst
+/// sämre text, utan att något i gränssnittet antydde det. Språkvalet i Inställningar
+/// styr därför bara molnvägen, där servern väljer talmodell per språk. Lokalt språkval
+/// kräver en modell per språk i installationen.
 fn transcribe(
     data: &[f32],
     source: &str,
     app: &AppHandle,
     session_state: Arc<Mutex<SessionState>>,
     start_offset: f64,
-    language: String,
 ) {
     let spec = hound::WavSpec {
         channels: 1,
@@ -1745,10 +1805,12 @@ fn transcribe(
             .map(|n| n.get().min(4).to_string())
             .unwrap_or_else(|_| "4".to_string());
 
+        // -l sv är hårdkodat med flit: modellen i bundlen är KB:s svenska finetune.
+        // Se doc-kommentaren på `transcribe`.
         let args = vec![
             "-m", &clean_resource_path,
             "-f", &clean_filename,
-            "-l", &language,
+            "-l", "sv",
             "-t", &num_threads,
             "--beam-size", "1",
             "--best-of", "1",

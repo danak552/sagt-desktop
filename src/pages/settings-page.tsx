@@ -2,10 +2,11 @@ import { useEffect, useState } from "react";
 import { CURRENT_VERSION } from "@/lib/version";
 import { Slider } from "@/components/ui/slider";
 import { useSettingsStore, TranscriptionLanguage, LocalAudioRetention } from "@/store/settings-store";
-import { getStorageUsage, runStorageCleanup, formatBytes, type StorageUsage } from "@/lib/storage";
+import { getStorageUsage, runStorageCleanup, openRecordingsFolder, formatBytes, type StorageUsage } from "@/lib/storage";
 import { useAudioAmplitude } from "@/hooks/use-audio-amplitude";
-import { Cpu, Cloud, Sparkles, HardDrive, Lock, Mic, Languages, ChevronDown, ChevronUp } from "lucide-react";
+import { Cpu, Cloud, Sparkles, HardDrive, Lock, Mic, Languages, ChevronDown, ChevronUp, FolderOpen } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import { InfoHint } from "@/components/ui/info-hint";
 import { invoke } from "@tauri-apps/api/core";
 import { useAuthStore } from "@/store/auth-store";
 import { useConfigStore } from "@/store/config-store";
@@ -17,6 +18,21 @@ const VAD_PRESETS = [
     { label: "Normal",     threshold: 0.008, silence: 1200 },
     { label: "Bullrig",    threshold: 0.020, silence: 1500 },
 ] as const;
+
+/**
+ * Etikett + valfri förklaringsbubbla. Finns för att göra textmönstret svårt att avvika
+ * från: varje inställning har en etikett, EN kort synlig rad (renderas av anroparen) och
+ * konsekvenserna bakom ⓘ. Innan detta hade vissa inställningar tre rader löptext och
+ * andra ingen alls.
+ */
+function SettingLabel({ children, hint }: { children: React.ReactNode; hint?: React.ReactNode }) {
+    return (
+        <div className="flex items-center gap-1.5">
+            <label className="text-sm font-medium text-ink-soft">{children}</label>
+            {hint ? <InfoHint>{hint}</InfoHint> : null}
+        </div>
+    );
+}
 
 export function SettingsPage() {
     const {
@@ -65,6 +81,17 @@ export function SettingsPage() {
         getStorageUsage().then(setStorageUsage).catch(console.error);
     }, []);
 
+    // Lat mic-livscykel: öppna mikrofonen medan Inställningar visas så mikrofontestet
+    // nedan visar en live nivå, och släpp den vid lämning. Utanför inspelning/preview
+    // hålls micen inte alls → andra appar (webbläsarens inspelning, Teams/Zoom) kan
+    // använda mikrofonen fritt. Rust-sidans reconcile bygger/dropper strömmen.
+    useEffect(() => {
+        invoke("start_mic_preview").catch(console.error);
+        return () => {
+            invoke("stop_mic_preview").catch(console.error);
+        };
+    }, []);
+
     // Vid val av raderande policy: bekräfta, gallra direkt och visa frigjort utrymme.
     const handleLocalRetentionChange = async (policy: LocalAudioRetention) => {
         if (policy !== 'keep_all' && policy !== localAudioRetention) {
@@ -97,16 +124,19 @@ export function SettingsPage() {
 
     const amplitude = useAudioAmplitude();
 
+    // Debounce mot Rust medan sliders dras. App.tsx pushar samma värden vid appstart —
+    // den här effekten håller motorn i synk under sessionen, inte vid uppstart.
+    // transcriptionLanguage ingår inte: språket följer med moln-POSTen (lib/api.ts) och
+    // den lokala sidecarn kör alltid svenska.
     useEffect(() => {
         const timer = setTimeout(() => {
             invoke("update_audio_settings", {
                 threshold: vadThreshold,
                 silenceMs: silenceDuration,
-                language: transcriptionLanguage,
             }).catch(console.error);
         }, 200);
         return () => clearTimeout(timer);
-    }, [vadThreshold, silenceDuration, transcriptionLanguage]);
+    }, [vadThreshold, silenceDuration]);
 
     const activePreset = VAD_PRESETS.find(
         p => p.threshold === vadThreshold && p.silence === silenceDuration
@@ -131,7 +161,9 @@ export function SettingsPage() {
                     {/* Device Selection */}
                     <div className="bg-white p-6 rounded-lg border shadow-sm space-y-4">
                         <div className="space-y-3">
-                            <label className="text-sm font-medium text-ink-soft">Mikrofon</label>
+                            <SettingLabel hint="Väljer du fel enhet blir din egen kanal tyst medan mötets ljud fortfarande spelas in. Bytet tar effekt inom ett par sekunder — du behöver inte starta om appen.">
+                                Mikrofon
+                            </SettingLabel>
                             <select
                                 value={inputDevice || ""}
                                 onChange={(e) => {
@@ -148,14 +180,16 @@ export function SettingsPage() {
                                 ))}
                             </select>
                             <p className="text-xs text-muted-foreground">
-                                Välj rätt mikrofon för att undvika tystnad. Bytet tar effekt inom ett par sekunder.
+                                Ljudkällan för din egen röst i inspelningen.
                             </p>
                         </div>
 
                         {/* Visualizer */}
                         <div className="space-y-3 pt-2 border-t">
                             <div className="flex justify-between items-center">
-                                <label className="text-sm font-medium text-ink-soft">Mikrofontest</label>
+                                <SettingLabel hint="Den röda linjen är din känslighetströskel. Ligger stapeln under linjen när du talar uppfattas du som tyst. Ligger den över när rummet är tyst plockar appen upp bakgrundsljud.">
+                                    Mikrofontest
+                                </SettingLabel>
                                 <span className="text-xs font-mono text-muted-foreground">
                                     Nivå: {(amplitude.mic * 100).toFixed(1)}%
                                 </span>
@@ -172,13 +206,18 @@ export function SettingsPage() {
                                 />
                             </div>
                             <p className="text-xs text-muted-foreground">
-                                Den röda linjen visar din tröskel. Prata normalt — stapeln ska gå över linjen. Tyst — stapeln ska vara under.
+                                Prata normalt — stapeln ska gå över den röda linjen.
                             </p>
                         </div>
 
                         {/* VAD Presets */}
                         <div className="space-y-3 pt-2 border-t">
-                            <label className="text-sm font-medium text-ink-soft">Mikrofonkänslighet</label>
+                            <SettingLabel hint="Tyst rum sänker tröskeln så att även låg röst fångas. Bullrig höjer den så att fläktar och tangentbord inte startar transkribering. Normal passar de flesta.">
+                                Mikrofonkänslighet
+                            </SettingLabel>
+                            <p className="text-xs text-muted-foreground">
+                                Hur mycket ljud som krävs för att appen ska uppfatta tal.
+                            </p>
                             <div className="grid grid-cols-3 gap-3">
                                 {VAD_PRESETS.map((preset) => (
                                     <button
@@ -190,7 +229,7 @@ export function SettingsPage() {
                                                 : 'border-line bg-white text-ink-soft hover:bg-paper-dim'
                                         }`}
                                     >
-                                        {preset.label === "Tyst rum" ? "🔇" : preset.label === "Normal" ? "🗣️" : "🔊"} {preset.label}
+                                        {preset.label}
                                     </button>
                                 ))}
                             </div>
@@ -286,9 +325,11 @@ export function SettingsPage() {
                         {isPro && (
                             <div className="border-t pt-4 space-y-4">
                                 <div className="space-y-1">
-                                    <label className="text-sm font-medium text-ink-soft">Molntranskribering — struktur</label>
+                                    <SettingLabel hint={<>Du/Mötet transkriberar mikrofon och mötesljud var för sig. Det ger bäst &quot;vem sa vad&quot; och tål överhörning, men <strong className="text-ink">räknas dubbelt mot din månadsgräns</strong>. Sammanhängande mixar till ett spår och räknas enkelt.</>}>
+                                        Talare i livetranskriptionen
+                                    </SettingLabel>
                                     <p className="text-xs text-muted-foreground">
-                                        Hur talare visas under livetranskribering i molnet.
+                                        Hur talarna visas medan mötet transkriberas i molnet.
                                     </p>
                                 </div>
                                 <div className="grid grid-cols-2 gap-3">
@@ -300,8 +341,8 @@ export function SettingsPage() {
                                                 : 'border-line bg-white hover:bg-paper-dim'
                                         }`}
                                     >
-                                        <div className="text-sm font-medium text-ink">🗣️ Du / Mötet</div>
-                                        <div className="text-xs text-ink-muted mt-0.5">Separata talare. ~2× minuter. Bäst "vem sa vad".</div>
+                                        <div className="text-sm font-medium text-ink">Du / Mötet</div>
+                                        <div className="text-xs text-ink-muted mt-0.5">Separata talare</div>
                                     </button>
                                     <button
                                         onClick={() => setCloudDiarizationMode('merged')}
@@ -311,18 +352,17 @@ export function SettingsPage() {
                                                 : 'border-line bg-white hover:bg-paper-dim'
                                         }`}
                                     >
-                                        <div className="text-sm font-medium text-ink">📄 Sammanhängande</div>
-                                        <div className="text-xs text-ink-muted mt-0.5">Ett stycke, styckesbryt vid pauser. 1× minuter.</div>
+                                        <div className="text-sm font-medium text-ink">Sammanhängande</div>
+                                        <div className="text-xs text-ink-muted mt-0.5">Ett löpande stycke</div>
                                     </button>
                                 </div>
-                                <p className="text-xs text-muted-foreground">
-                                    Du/Mötet transkriberar båda kanalerna separat (räknas dubbelt mot din månadsgräns) och är robustare vid överhörning. Sammanhängande mixar till ett spår (1×).
-                                </p>
 
                                 {/* Pausbryt-tröskel — gäller båda lägena, härleds ur talpaus */}
                                 <div className="space-y-3 pt-1">
                                     <div className="flex justify-between">
-                                        <label className="text-sm font-medium text-ink-soft">Styckesbryt vid paus</label>
+                                        <SettingLabel hint="Rent visuellt — påverkar bara hur texten radbryts, aldrig transkriberingen eller vad du debiteras.">
+                                            Styckesbryt vid paus
+                                        </SettingLabel>
                                         <span className="text-sm font-mono bg-paper-dim px-2 py-0.5 rounded">
                                             {(pauseBreakMs / 1000).toFixed(1)} s
                                         </span>
@@ -335,23 +375,24 @@ export function SettingsPage() {
                                         onValueChange={(val) => setPauseBreakMs(val[0])}
                                     />
                                     <p className="text-xs text-muted-foreground">
-                                        En talpaus längre än detta ger ett nytt stycke (och extra luft i Du/Mötet-vyn).
+                                        En talpaus längre än detta ger ett nytt stycke.
                                     </p>
                                 </div>
 
                                 {/* §13.4 mic-kanal-hint — en talare vid mikrofonen (default på) */}
                                 <div className="space-y-3 pt-1">
                                     <div>
-                                        <label className="text-sm font-medium text-ink-soft">Bara jag talar i mikrofonen</label>
+                                        <SettingLabel hint={<>Håller din mikrofonkanal som en enda röst så att du inte delas upp i &quot;Du 1&quot; och &quot;Du 2&quot;. Stäng av om ni sitter flera vid samma mikrofon.<br /><br />Påverkar inte den automatiska talarsepareringen efter mötet — den delar bara upp mötesljudet, aldrig din mikrofon.</>}>
+                                            Talare i din mikrofon
+                                        </SettingLabel>
                                         <p className="text-xs text-muted-foreground mt-1">
-                                            <strong>På</strong> (standard): din mikrofonkanal behandlas som en enda talare — hindrar att du delas upp i "Du 1" och "Du 2".
-                                            <strong> Av</strong>: slå av om ni är flera som delar samma mikrofon.
+                                            Gäller när hela inspelningen omtranskriberas med talarseparering.
                                         </p>
                                     </div>
                                     <div className="grid grid-cols-2 gap-3">
                                         {([
-                                            { value: true, label: '👤 På — en talare' },
-                                            { value: false, label: '👥 Av — flera talare' },
+                                            { value: true, label: 'En talare' },
+                                            { value: false, label: 'Flera talare' },
                                         ] as { value: boolean; label: string }[]).map(({ value, label }) => (
                                             <button
                                                 key={String(value)}
@@ -370,16 +411,17 @@ export function SettingsPage() {
                                 {/* §steg 5 — automatik efter möte (opt-out, default på) */}
                                 <div className="space-y-3 pt-1">
                                     <div>
-                                        <label className="text-sm font-medium text-ink-soft">Automatisk talarseparering efter möte</label>
+                                        <SettingLabel hint="I manuellt läge kör du samma separering via knappen i transkriptet, när du vill. Kräver att ljudfilen finns kvar på datorn.">
+                                            Talarseparering efter möte
+                                        </SettingLabel>
                                         <p className="text-xs text-muted-foreground mt-1">
-                                            <strong>På</strong> (standard): Mötet-kanalen delas i Talare 1/2/3 automatiskt när du stoppar inspelningen.
-                                            <strong> Av</strong>: kör talarsepareringen manuellt via knappen i transkriptet.
+                                            Delar mötesljudet i Talare 1, 2, 3 när du stoppar inspelningen.
                                         </p>
                                     </div>
                                     <div className="grid grid-cols-2 gap-3">
                                         {([
-                                            { value: true, label: '✅ På — automatiskt' },
-                                            { value: false, label: '✋ Av — manuellt' },
+                                            { value: true, label: 'Automatiskt' },
+                                            { value: false, label: 'Manuellt' },
                                         ] as { value: boolean; label: string }[]).map(({ value, label }) => (
                                             <button
                                                 key={String(value)}
@@ -397,16 +439,17 @@ export function SettingsPage() {
 
                                 <div className="space-y-3 pt-1">
                                     <div>
-                                        <label className="text-sm font-medium text-ink-soft">Automatisk analys efter möte</label>
+                                        <SettingLabel hint="Gäller molnläge. I manuellt läge startar du analysen från transkriptet när mötet är klart.">
+                                            Analys efter möte
+                                        </SettingLabel>
                                         <p className="text-xs text-muted-foreground mt-1">
-                                            <strong>På</strong> (standard): AI-analysen (sammanfattning, beslut, åtgärder) startar automatiskt när du stoppar inspelningen i molnläge.
-                                            <strong> Av</strong>: starta analysen manuellt i transkriptet.
+                                            Startar sammanfattning, beslut och åtgärder när du stoppar inspelningen.
                                         </p>
                                     </div>
                                     <div className="grid grid-cols-2 gap-3">
                                         {([
-                                            { value: true, label: '✅ På — automatiskt' },
-                                            { value: false, label: '✋ Av — manuellt' },
+                                            { value: true, label: 'Automatiskt' },
+                                            { value: false, label: 'Manuellt' },
                                         ] as { value: boolean; label: string }[]).map(({ value, label }) => (
                                             <button
                                                 key={String(value)}
@@ -428,13 +471,15 @@ export function SettingsPage() {
                         <div className="border-t pt-4 space-y-3">
                             <div className="flex items-center gap-2">
                                 <Languages className="w-4 h-4 text-ink-muted" />
-                                <label className="text-sm font-medium text-ink-soft">Inspelningsspråk</label>
+                                <SettingLabel hint={<>Molnet byter talmodell efter språk: svenska via KB-Whisper (Kungliga biblioteket), norska via NB-Whisper (Nasjonalbiblioteket) och engelska via Whisper Large v3.<br /><br />Transkribering på din dator använder alltid KB:s svenska modell — det är den enda som följer med i installationen.</>}>
+                                    Inspelningsspråk
+                                </SettingLabel>
                             </div>
                             <div className="grid grid-cols-3 gap-3">
                                 {([
-                                    { value: 'sv', flag: '🇸🇪', label: 'Svenska',  desc: 'Optimerad för svenska' },
-                                    { value: 'no', flag: '🇳🇴', label: 'Norska',   desc: 'Optimerad för norska' },
-                                    { value: 'en', flag: '🇬🇧', label: 'Engelska', desc: 'Flerspråkig' },
+                                    { value: 'sv', flag: '🇸🇪', label: 'Svenska',  desc: 'KB-Whisper' },
+                                    { value: 'no', flag: '🇳🇴', label: 'Norska',   desc: 'NB-Whisper' },
+                                    { value: 'en', flag: '🇬🇧', label: 'Engelska', desc: 'Whisper Large v3' },
                                 ] as { value: TranscriptionLanguage; flag: string; label: string; desc: string }[]).map(({ value, flag, label, desc }) => (
                                     <button
                                         key={value}
@@ -447,11 +492,23 @@ export function SettingsPage() {
                                     >
                                         <div className="text-sm font-medium text-ink">{flag} {label}</div>
                                         <div className="text-xs text-ink-muted mt-0.5">{desc}</div>
+                                        {/* Endast svenska finns i installationen. Utan denna markering tänds
+                                            norska/engelska som "vald" i lokalt läge medan sidecarn ändå kör
+                                            svenska — valet skulle se ut att gälla utan att göra något.
+                                            Informerar, blockerar inte: en Pro-användare kan vilja välja språk
+                                            innan hen byter till molnläge. */}
+                                        {value !== 'sv' && recordingMode === 'local' && (
+                                            <div className="text-[10px] text-amber-700 bg-amber-50 border border-amber-200/60 rounded px-1.5 py-0.5 mt-1.5 w-fit">
+                                                Endast moln
+                                            </div>
+                                        )}
                                     </button>
                                 ))}
                             </div>
                             <p className="text-xs text-muted-foreground">
-                                Välj språket du spelar in på. Påverkar vilken AI-modell som används i molnet.
+                                {recordingMode === 'local'
+                                    ? "Gäller molnläge. På datorn transkriberas alltid svenska."
+                                    : "Språket du talar. Gäller transkribering i molnet."}
                             </p>
                         </div>
                     </div>
@@ -536,17 +593,17 @@ export function SettingsPage() {
                         {/* Molnsynk (opt-in, default av — privacy-first) */}
                         <div className="border-t pt-6 space-y-3">
                             <div>
-                                <label className="text-sm font-medium text-ink">Synka resultat till mitt konto</label>
+                                <SettingLabel hint={<>Av (standard): molntranskriptionen visas bara på den här datorn. På: resultatet syns i dashboarden på sagt.ai och på dina andra enheter.<br /><br />Styr inte om ljud laddas upp för transkribering — det avgörs av inspelningsläget ovan.</>}>
+                                    Synk till ditt konto
+                                </SettingLabel>
                                 <p className="text-xs text-muted-foreground mt-1">
-                                    <strong>Av</strong> (standard): molntranskriberingen visas bara här på datorn — inget sparas i molnet.
-                                    <strong> På</strong>: resultatet sparas i ditt konto och visas i dashboarden på sagt.ai (synk mellan enheter).
-                                    Styr inte om ljud laddas upp för transkribering — det avgörs av inspelningsläget ovan.
+                                    Sparar transkript och analys i ditt konto på sagt.ai.
                                 </p>
                             </div>
                             <div className="grid grid-cols-2 gap-3">
                                 {([
-                                    { value: false, label: '🔒 Av — endast lokalt' },
-                                    { value: true, label: '☁ På — synka till konto' },
+                                    { value: false, label: 'Av — bara här' },
+                                    { value: true, label: 'På — synka' },
                                 ] as { value: boolean; label: string }[]).map(({ value, label }) => (
                                     <button
                                         key={String(value)}
@@ -565,8 +622,10 @@ export function SettingsPage() {
                         {/* Lagring (moln) */}
                         <div className="border-t pt-6 space-y-3">
                             <div>
-                                <label className="text-sm font-medium text-ink">Lagring av ljudfiler i molnet</label>
-                                <p className="text-xs text-muted-foreground">Hur länge ljudfiler sparas i molnet efter analys.</p>
+                                <SettingLabel hint={<>Gäller filer du laddar upp för omtranskribering eller analys.<br /><br /><strong className="text-ink">Livetranskribering sparar aldrig ljud</strong> — varje ljudbit transkriberas i minnet och kastas direkt. Det finns alltså inget att gallra där.</>}>
+                                    Ljudfiler i molnet
+                                </SettingLabel>
+                                <p className="text-xs text-muted-foreground">Hur länge en uppladdad ljudfil ligger kvar efter analys.</p>
                             </div>
 
                             <div className="grid grid-cols-2 gap-3">
@@ -591,9 +650,11 @@ export function SettingsPage() {
                         {/* Lokal lagring — diskanvändning + gallringspolicy */}
                         <div className="border-t pt-6 space-y-3">
                             <div>
-                                <label className="text-sm font-medium text-ink">Lokal lagring</label>
+                                <SettingLabel hint="Transkript och analyser behålls alltid — bara ljudet gallras. Ljudfilen behövs för att kunna köra om transkriberingen eller talarsepareringen i efterhand.">
+                                    Ljudfiler på den här datorn
+                                </SettingLabel>
                                 <p className="text-xs text-muted-foreground">
-                                    Gäller ljudfiler på den här datorn. Transkript och analyser behålls alltid — endast ljudet raderas.
+                                    Hur länge inspelat ljud sparas lokalt.
                                 </p>
                             </div>
 
@@ -607,6 +668,16 @@ export function SettingsPage() {
                                 ) : (
                                     <span>Beräknar diskanvändning…</span>
                                 )}
+                                <button
+                                    onClick={() => openRecordingsFolder().catch((e) => {
+                                        console.error("Kunde inte öppna inspelningsmappen:", e);
+                                        toast.error("Kunde inte öppna mappen.");
+                                    })}
+                                    className="ml-auto shrink-0 inline-flex items-center gap-1 text-brand hover:underline font-medium"
+                                >
+                                    <FolderOpen className="w-3.5 h-3.5" />
+                                    Öppna mapp
+                                </button>
                             </div>
 
                             <div className="grid grid-cols-2 gap-3">

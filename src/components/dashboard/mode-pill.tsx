@@ -24,17 +24,19 @@ export function ModePill({ onUpsellClick }: ModePillProps) {
     const isProcessing = isProcessingLocal || uploadStatus === 'uploading' || processingStatus === 'PROCESSING' || processingStatus === 'PENDING';
     const derivedMode = (!isSignedIn || !isPro) ? 'local' : effectiveMode;
 
+    // "Large"/"Small" är modellstorlekar, inte något användaren valt eller behöver känna
+    // till. Kvalitetsskillnaden förklaras där valet faktiskt görs (dropdownen nedan).
     const getModeName = (mode: string) => {
         // cloud_analysis treated as cloud — mode no longer selectable but may exist in localStorage
-        if (mode === 'cloud_analysis' || mode === 'cloud') return "Moln (Large)";
-        return "Lokal (Small)";
+        if (mode === 'cloud_analysis' || mode === 'cloud') return "Moln";
+        return "Lokalt";
     };
 
     // Determine visual state based on effective mode and online status
     const getPillState = () => {
         if (isRecording) {
             return {
-                label: `Inspelning pågår • ${getModeName(derivedMode)}`,
+                label: `Spelar in • ${getModeName(derivedMode)}`,
                 colorClass: "bg-red-500/10 text-red-500 border-red-200/50 animate-[pulse_2s_cubic-bezier(0.4,0,0.6,1)_infinite]",
                 icon: <span className="relative flex h-2 w-2"><span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-red-400 opacity-75"></span><span className="relative inline-flex rounded-full h-2 w-2 bg-red-500"></span></span>
             };
@@ -50,7 +52,7 @@ export function ModePill({ onUpsellClick }: ModePillProps) {
 
         if (!isOnline && (recordingMode === 'cloud_analysis' || recordingMode === 'cloud' )) {
             return {
-                label: "Lokal (Small) - Offline",
+                label: "Lokalt — offline",
                 colorClass: "bg-amber-50 text-amber-700 border-amber-200/50 hover:bg-amber-100",
                 icon: <ShieldAlert className="w-3.5 h-3.5" />
             };
@@ -96,7 +98,7 @@ export function ModePill({ onUpsellClick }: ModePillProps) {
             <DropdownMenuContent align="end" className="w-64 rounded-xl border border-line shadow-xl p-2 bg-white/95 backdrop-blur-sm">
                 <div className="px-2 py-1.5 mb-1">
                     <p className="text-xs font-semibold text-ink">Inspelningsläge</p>
-                    <p className="text-[10px] text-ink-muted leading-tight mt-0.5">Välj var din ljudfil ska hanteras. Molnbearbetning ger överlägsen kvalitet.</p>
+                    <p className="text-[10px] text-ink-muted leading-tight mt-0.5">Var ljudet bearbetas.</p>
                 </div>
 
                 <DropdownMenuItem
@@ -107,12 +109,12 @@ export function ModePill({ onUpsellClick }: ModePillProps) {
                         <div className="flex items-center gap-2">
                             <Cloud className={`w-4 h-4 ${(recordingMode === 'cloud' || recordingMode === 'cloud_analysis') ? 'text-brand' : 'text-ink-soft'}`} />
                             <span className={`text-sm font-medium ${(recordingMode === 'cloud' || recordingMode === 'cloud_analysis') ? 'text-brand' : 'text-ink-soft'}`}>
-                                Moln (Large)
+                                Moln
                             </span>
                         </div>
                         {!isPro && <Lock className="w-3 h-3 text-ink-muted" />}
                     </div>
-                    <p className="text-[10px] text-ink-muted mt-1 ml-6">Perfekt transkription via Berget.ai. Analysera manuellt med ⟳-knappen.</p>
+                    <p className="text-[10px] text-ink-muted mt-1 ml-6">Högsta precisionen. Ljudet bearbetas på EU-servrar.</p>
                 </DropdownMenuItem>
 
                 <DropdownMenuItem
@@ -123,11 +125,11 @@ export function ModePill({ onUpsellClick }: ModePillProps) {
                         <div className="flex items-center gap-2">
                             <HardDrive className={`w-4 h-4 ${recordingMode === 'local' ? 'text-ink-soft' : 'text-ink-muted'}`} />
                             <span className={`text-sm font-medium ${recordingMode === 'local' ? 'text-ink' : 'text-ink-soft'}`}>
-                                Lokal (Small)
+                                Lokalt
                             </span>
                         </div>
                     </div>
-                    <p className="text-[10px] text-ink-muted mt-1 ml-6">Ljudet lämnar aldrig din dator. Bra för extremt känsliga möten.</p>
+                    <p className="text-[10px] text-ink-muted mt-1 ml-6">Ljudet lämnar aldrig datorn. Fungerar offline.</p>
                 </DropdownMenuItem>
             </DropdownMenuContent>
         </DropdownMenu>
