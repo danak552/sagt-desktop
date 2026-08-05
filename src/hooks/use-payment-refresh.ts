@@ -58,9 +58,12 @@ export function usePaymentRefresh() {
         timeoutRef.current = setTimeout(stopPolling, POLL_TIMEOUT_MS)
     }, [doPoll, stopPolling])
 
-    // One-shot refresh — for "Jag har betalat" button
-    const manualRefresh = useCallback(async () => {
-        await doPoll()
+    // One-shot refresh — for "Jag har betalat" button.
+    // Returnerar om prenumerationen nu är aktiv, så anroparen kan skilja "inte klar än"
+    // från "klart" och säga det till användaren. Utan returvärdet blir knappen tyst vid
+    // misslyckande, vilket är exakt det läge där användaren behöver besked mest.
+    const manualRefresh = useCallback(async (): Promise<boolean> => {
+        return await doPoll()
     }, [doPoll])
 
     return { isWaiting, startPolling, stopPolling, manualRefresh }

@@ -12,7 +12,7 @@ import { useSettingsStore } from "./store/settings-store";
 import { useSyncStore } from "./store/sync-store";
 import { Toaster, toast } from "sonner";
 import { useConnectivity } from "@/hooks/use-connectivity";
-import { usePaymentRefresh } from "@/hooks/use-payment-refresh";
+import { useSessionRefresh } from "@/hooks/use-session-refresh";
 import { useUpdater } from "@/hooks/use-updater";
 import { useCloudStream } from "@/hooks/use-cloud-stream";
 import { useLiveSpeakerNaming } from "@/hooks/use-live-speaker-naming";
@@ -29,10 +29,10 @@ function App() {
   useCloudStream();
   useLiveSpeakerNaming();
   useLiveDiarize();
+  useSessionRefresh();
 
   const [currentView, setCurrentView] = useState<'dashboard' | 'settings' | 'recordings'>('dashboard');
   const isSignedIn = useAuthStore((s) => s.isSignedIn);
-  const { manualRefresh } = usePaymentRefresh();
 
   // Återställ molnläge för Pro-användare vars inställning nollställdes av v0.9.18-migrering.
   // Kör varje gång isSignedIn ändras (auth laddas asynkront efter mount).
@@ -144,15 +144,6 @@ function App() {
       unlistenCleared.then((f) => f());
     };
   }, []);
-
-  // Hämta färsk Pro-status vid appstart och sedan var 60:e sekund.
-  // Fångar upp avslutade eller nyaktiverade prenumerationer under aktiv session.
-  useEffect(() => {
-    if (!isSignedIn) return;
-    manualRefresh();
-    const id = setInterval(manualRefresh, 60_000);
-    return () => clearInterval(id);
-  }, [isSignedIn]);
 
   return (
     <div className="flex flex-col h-screen w-screen overflow-hidden bg-paper-dim text-foreground font-sans antialiased text-sm">

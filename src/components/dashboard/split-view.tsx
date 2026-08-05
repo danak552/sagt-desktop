@@ -18,7 +18,6 @@ import { useAuthStore, WAS_PRO_KEY } from "@/store/auth-store";
 import { toast } from "sonner";
 import { ModePill } from "./mode-pill";
 import { UpsellModal } from "./upsell-modal";
-import { usePaymentRefresh } from "@/hooks/use-payment-refresh";
 import { usePostHogEvents, showError, captureEvent } from "@/hooks/use-posthog-events";
 import { useSlowLocalHint } from "@/hooks/use-slow-local-hint";
 
@@ -49,7 +48,6 @@ export function SplitView() {
     const email = useAuthStore((s) => s.email);
     const clearSession = useAuthStore((s) => s.clearSession);
     const events = usePostHogEvents();
-    const { isWaiting: isPaymentWaiting, stopPolling: stopPaymentPolling } = usePaymentRefresh();
     const [showUpsellModal, setShowUpsellModal] = useState(false);
     const [showUserMenu, setShowUserMenu] = useState(false);
     const userMenuRef = useRef<HTMLDivElement>(null);
@@ -1666,28 +1664,19 @@ export function SplitView() {
                 {(!isSignedIn || !isPro) && (
                     <div className="absolute inset-0 z-[51] bg-white/55 backdrop-blur-[2px] grid place-items-center pointer-events-none">
                         <div className="pointer-events-auto">
-                            {isPaymentWaiting ? (
-                                <div className="flex flex-col items-center gap-2">
-                                    <div className="inline-flex items-center gap-2 rounded-full bg-ink text-paper text-xs font-semibold px-4 py-2 shadow-md">
-                                        <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                                        Väntar på betalning...
-                                    </div>
-                                    <button
-                                        onClick={stopPaymentPolling}
-                                        className="text-xs text-ink-muted hover:text-ink-soft transition-colors"
-                                    >
-                                        Avbryt
-                                    </button>
-                                </div>
-                            ) : (
-                                <button
-                                    onClick={() => setShowUpsellModal(true)}
-                                    className="inline-flex items-center gap-2 rounded-full bg-ink text-paper text-xs font-semibold px-4 py-2 hover:bg-ink/90 transition-colors shadow-md"
-                                >
-                                    <Lock className="w-3.5 h-3.5" />
-                                    Lås upp med Pro
-                                </button>
-                            )}
+                            {/* Här fanns tidigare en "Väntar på betalning..."-gren styrd av en egen
+                                usePaymentRefresh-instans. Den kunde aldrig renderas: hookens isWaiting är
+                                per-instans useState och den här instansen anropade aldrig startPolling —
+                                modalen har sin egen. Och även med delat tillstånd hade grenen varit
+                                oåtkomlig, eftersom overlayen (z-51) bara syns när modalen (z-100) är
+                                stängd, och varje väg som stänger modalen anropar stopPolling(). */}
+                            <button
+                                onClick={() => setShowUpsellModal(true)}
+                                className="inline-flex items-center gap-2 rounded-full bg-ink text-paper text-xs font-semibold px-4 py-2 hover:bg-ink/90 transition-colors shadow-md"
+                            >
+                                <Lock className="w-3.5 h-3.5" />
+                                Lås upp med Pro
+                            </button>
                         </div>
                     </div>
                 )}
