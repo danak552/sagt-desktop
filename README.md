@@ -12,6 +12,11 @@ It listens to **your computer's audio** rather than integrating with a meeting p
 
 > **Early access:** This is a public beta. Expect rough edges. If something breaks, [open an issue](../../issues) — we read every one.
 
+> **⭐ If this is useful to you, a star helps.** It is the main way small open source
+> projects become findable — several directories that list open source software use a
+> star threshold as their entry requirement, so it decides whether anyone else gets to
+> discover the project at all.
+
 ---
 
 ## What it does
