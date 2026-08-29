@@ -1,6 +1,10 @@
 // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
 mod audio;
 mod audio_meter;
+/// Systemljud via Core Audio Taps. All osäker CoreAudio-FFI är isolerad här,
+/// på samma sätt som audio_meter.rs isolerar WASAPI:s COM-kod.
+#[cfg(target_os = "macos")]
+mod mac_sysaudio;
 mod database;
 
 use database::{CleanupResult, DatabaseManager, Recording, Segment, StorageUsage};
@@ -322,6 +326,37 @@ pub fn run() {
                 let _ = Command::new("taskkill")
                     .args(&["/F", "/IM", "whisper-cli*"])
                     .output();
+            }
+            // 🔴 pkill -x, INTE -f. `-x` matchar processNAMNET exakt; `-f` matchar mot
+            // hela kommandoraden och hade dödat vilken process som helst som råkar ha
+            // strängen i sina argument — inklusive en terminal där någon just skrivit
+            // kommandot, eller den här appen själv om sökvägen nämns i argv.
+            #[cfg(not(target_os = "windows"))]
+            {
+                use std::process::Command;
+                for name in ["whisper-cli", "whisper-cli-aarch64-apple-darwin"] {
+                    let _ = Command::new("pkill").args(["-x", name]).output();
+                }
+            }
+
+            // Ljudbehörigheten begärs vid START, inte vid första inspelningen.
+            // Skälet är rent UX: dialogen dyker upp när användaren precis öppnat
+            // appen och förstår varför den frågar, i stället för mitt i ett möte.
+            // Utan detta hade FÖRSTA inspelningen alltid tappat systemljudet,
+            // eftersom try_sys_capture då ser NotDetermined och degraderar.
+            //
+            // Vi väntar inte på svaret — dialogen är asynkron och varje inspelning
+            // läser statusen på nytt med preflight().
+            #[cfg(target_os = "macos")]
+            {
+                use crate::mac_sysaudio::{self, Permission};
+                match mac_sysaudio::preflight() {
+                    Permission::NotDetermined => {
+                        println!("DEBUG: Ljudbehörighet ej beslutad — begär vid start");
+                        mac_sysaudio::request_permission();
+                    }
+                    p => println!("DEBUG: Ljudbehörighet vid start: {:?}", p),
+                }
             }
 
             app.manage(audio::AudioMonitor::new());

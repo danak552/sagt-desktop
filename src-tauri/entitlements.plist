@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- Hardened runtime (krävs för notarisering) blockerar ljudåtkomst utan denna. -->
+    <key>com.apple.security.device.audio-input</key>
+    <true/>
+
+    <!-- ⚠️ com.apple.security.cs.disable-library-validation är MEDVETET utelämnad.
+         Den behövs inte tack vare att whisper-cli är statiskt länkad, och den
+         försvagar hardened runtime genom att tillåta inläsning av osignerade
+         bibliotek. Lägg inte till den "för säkerhets skull". -->
+</dict>
+</plist>

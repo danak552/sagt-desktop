@@ -531,7 +531,22 @@ export function SettingsPage() {
                                         Standardläge för inspelning
                                         {!isPro && <Lock className="w-3.5 h-3.5 text-amber-500" />}
                                     </h3>
-                                    <p className="text-xs text-muted-foreground mt-1">Välj hur dina inspelningar hanteras som standard.</p>
+                                    <p className="text-xs text-muted-foreground mt-1">
+                                        Välj hur dina inspelningar hanteras som standard.{" "}
+                                        {/* Länken sitter här och inte i en egen sektion: det är i det här valet
+                                            användaren avgör om ljudet lämnar datorn, och det är då frågan om
+                                            ansvar för mötesdeltagarnas uppgifter faktiskt uppstår. */}
+                                        <button
+                                            type="button"
+                                            className="underline underline-offset-2 hover:text-ink transition-colors"
+                                            onClick={async () => {
+                                                const { invoke } = await import('@tauri-apps/api/core');
+                                                invoke('plugin:shell|open', { path: 'https://sagt.ai/dina-uppgifter' });
+                                            }}
+                                        >
+                                            Vad gäller när du spelar in andra?
+                                        </button>
+                                    </p>
                                 </div>
                                 {!isPro && (
                                     <Button

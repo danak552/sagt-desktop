@@ -17,14 +17,19 @@
 // All osäker COM-kod är isolerad här. Alla fel degraderar till tom Vec → audio.rs
 // beter sig då exakt som före denna feature (binder till console-defaulten).
 
+#[cfg(windows)]
 use std::cell::{Cell, RefCell};
 
+#[cfg(windows)]
 use windows::Win32::Devices::FunctionDiscovery::PKEY_Device_FriendlyName;
+#[cfg(windows)]
 use windows::Win32::Media::Audio::Endpoints::IAudioMeterInformation;
+#[cfg(windows)]
 use windows::Win32::Media::Audio::{
     eRender, IMMDevice, IMMDeviceCollection, IMMDeviceEnumerator, MMDeviceEnumerator,
     DEVICE_STATE_ACTIVE,
 };
+#[cfg(windows)]
 use windows::Win32::System::Com::{
     CoCreateInstance, CoInitializeEx, CLSCTX_ALL, COINIT_MULTITHREADED, STGM_READ,
 };
@@ -37,6 +42,7 @@ pub struct EndpointLevel {
     pub peak: f32,
 }
 
+#[cfg(windows)]
 thread_local! {
     // CoInitializeEx per tråd, exakt en gång — obalanserad Uninitialize skulle kunna
     // riva COM under cpal som kör på samma tråd, och upprepade Init utan Uninitialize
@@ -48,6 +54,7 @@ thread_local! {
     static ENUMERATOR: RefCell<Option<IMMDeviceEnumerator>> = const { RefCell::new(None) };
 }
 
+#[cfg(windows)]
 fn ensure_com_initialized() {
     COM_INITIALIZED.with(|initialized| {
         if !initialized.get() {
@@ -61,6 +68,7 @@ fn ensure_com_initialized() {
 
 /// Kör `f` mot kollektionen av aktiva render-endpoints via den trådcachade
 /// enumeratorn. Fel gör cachen ogiltig så att nästa anrop bygger en färsk enumerator.
+#[cfg(windows)]
 fn with_active_render_endpoints<T>(
     f: impl FnOnce(&IMMDeviceCollection, u32) -> windows::core::Result<T>,
 ) -> windows::core::Result<T> {
@@ -87,6 +95,7 @@ fn with_active_render_endpoints<T>(
 }
 
 /// Friendly name för en endpoint, eller None om den saknar/döljer namn.
+#[cfg(windows)]
 fn friendly_name(device: &IMMDevice) -> Option<String> {
     unsafe {
         let store = device.OpenPropertyStore(STGM_READ).ok()?;
@@ -98,6 +107,7 @@ fn friendly_name(device: &IMMDevice) -> Option<String> {
 
 /// Peaknivå per aktiv render-endpoint. Fel på en enskild enhet hoppar över den;
 /// alla andra fel ger tom Vec (featuren degraderar tyst till dagens beteende).
+#[cfg(windows)]
 pub fn render_endpoint_levels() -> Vec<EndpointLevel> {
     match with_active_render_endpoints(|collection, count| {
         let mut levels = Vec::with_capacity(count as usize);
@@ -126,6 +136,7 @@ pub fn render_endpoint_levels() -> Vec<EndpointLevel> {
 /// output_devices() som format-probar varje enhet — den här går bara igenom namnen.
 /// COM-fel → true (anta att endpointen finns kvar): en faktiskt död pin fångas ändå av
 /// cpal:s failed-flagga, medan ett falskt "försvunnen" skulle rycka loopbacken i onödan.
+#[cfg(windows)]
 pub fn render_endpoint_exists(name: &str) -> bool {
     match with_active_render_endpoints(|collection, count| {
         for i in 0..count {
@@ -142,4 +153,27 @@ pub fn render_endpoint_exists(name: &str) -> bool {
             true
         }
     }
+}
+
+// ── icke-Windows: stubbar med IDENTISKA signaturer ────────────────────────────
+//
+// Detta är inte en lucka, det är rätt beteende. Modulen löser ett Windows-specifikt
+// problem: att Teams/Zoom routar samtalsljud till *kommunikationsenheten* medan cpal
+// alltid ger *console*-defaulten, så loopbacken kan lyssna på fel endpoint. Den
+// splitten finns inte på macOS — Core Audio Taps tappar processernas ljud direkt,
+// oavsett vilken utenhet de använder (se docs/macos/spike-coreaudio-tap/).
+//
+// Anropsställena i audio.rs lämnas därför orörda. De degraderar redan korrekt:
+// tom Vec → ingen kandidat att binda om till, false → en "pinnad" endpoint anses
+// borta. Och pinning kan aldrig uppstå på macOS, eftersom den sätts av just det
+// metersvep som här returnerar tomt.
+
+#[cfg(not(windows))]
+pub fn render_endpoint_levels() -> Vec<EndpointLevel> {
+    Vec::new()
+}
+
+#[cfg(not(windows))]
+pub fn render_endpoint_exists(_name: &str) -> bool {
+    false
 }

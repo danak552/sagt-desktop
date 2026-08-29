@@ -292,7 +292,22 @@ export function ControlBar({ onViewChange }: ControlBarProps) {
     return (
         <div className="h-24 border-t bg-white flex items-center justify-between px-8 relative z-30 shadow-[0_-4px_6px_-1px_rgba(0,0,0,0.05)]">
             <div className="text-sm font-medium text-muted-foreground flex flex-col min-w-[120px]">
-                <span className={`font-semibold transition-colors ${isRecording ? "text-red-500 animate-pulse" : "text-ink-muted"}`}>
+                {/*
+                  * `key` tvingar React att BYTA UT noden i stället för att mutera dess
+                  * text. Utan den smetade "Spelar in..." ovanpå "Redo" på macOS: WebKit
+                  * befordrar ett element med en oändlig CSS-animation (`animate-pulse`)
+                  * till ett eget kompositlager, och när textnoden inuti ett sådant lager
+                  * byts ut invalideras inte alltid den gamla glyfraden. Resultatet blir
+                  * två texter ovanpå varandra — vilket ser ut som ett layoutfel men inte
+                  * kan vara det, eftersom det bara finns ETT element.
+                  *
+                  * Uppmätt att det INTE är ett överlapp: vid 1040 px fönsterbredd slutar
+                  * den här kolumnen på 152 px och inspelningsknappen börjar på 232 px.
+                  */}
+                <span
+                    key={isRecording ? "recording" : "idle"}
+                    className={`font-semibold transition-colors ${isRecording ? "text-red-500 animate-pulse" : "text-ink-muted"}`}
+                >
                     {isRecording ? "Spelar in..." : "Redo"}
                 </span>
                 <span className="text-xs text-muted-foreground/60 font-mono">{formatTime(elapsedSeconds)}</span>

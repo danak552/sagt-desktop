@@ -46,7 +46,8 @@ export async function getStorageUsage(): Promise<StorageUsage> {
 }
 
 /**
- * Öppnar inspelningskatalogen i Utforskaren. Kärnlöftet är att ljudet stannar på datorn —
+ * Öppnar inspelningskatalogen i systemets filhanterare — Utforskaren på Windows,
+ * Finder på macOS. `openPath` väljer själv. Kärnlöftet är att ljudet stannar på datorn —
  * då ska användaren också kunna gå dit och se filerna, inte bara läsa en siffra i byte.
  *
  * Två vägar, i fallande ordning av hur bra resultatet blir:

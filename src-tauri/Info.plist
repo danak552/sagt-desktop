@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- 🔴 OBLIGATORISK. Utan NSMicrophoneUsageDescription DÖDAR macOS processen
+         vid första mikrofonåtkomst — det är ingen dialog man kan hoppa över, och
+         felet syns som en krasch utan förklaring. -->
+    <key>NSMicrophoneUsageDescription</key>
+    <string>Sagt.ai spelar in din mikrofon för att kunna transkribera det du säger.</string>
+
+    <!-- Systemljud via Core Audio Taps. Egen TCC-kategori, skild från mikrofon.
+         Utan den nekar macOS HELT TYST: varje anrop returnerar noErr och varje
+         sampel blir noll. Se docs/macos/spike-coreaudio-tap/. -->
+    <key>NSAudioCaptureUsageDescription</key>
+    <string>Sagt.ai spelar in mötesljudet från din dator så att även de andra deltagarna kommer med i transkriberingen.</string>
+</dict>
+</plist>

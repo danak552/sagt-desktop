@@ -15,10 +15,31 @@ dist-ssr
 # Miljöfiler — aldrig committa nycklar
 .env
 .env.*
+# ...utom mallen. Den innehåller ENBART platshållare och måste vara spårad:
+# README:ns "Build from source" säger `cp .env.example .env`, och utan den här
+# raden synkas filen aldrig till det publika sagt-desktop-repot — där
+# instruktionen då failar på första steget för alla som försöker bygga.
+# ⚠️ Lägg ALDRIG ett riktigt värde i .env.example. Endast `pk_test_...`-former.
+!.env.example
 
-# Genererade ikoner för plattformar vi inte bygger för (Windows-only app)
+# Genererade ikoner för plattformar vi inte bygger för
 src-tauri/icons/android/
 src-tauri/icons/ios/
+
+# 🔴 mac-sidecarn får ALDRIG committas. Den hämtas från GCS i CI (se
+# desktop-release.yml) och ligger här bara för lokala bygg.
+#
+# Regeln finns för att filen annars är OSPÅRAD men INTE ignorerad, vilket är det
+# farligaste läget: den syns i `git status` och sveps med av varje brett
+# `git add desktop/`. Det hände 2026-08-29 i release-committen och fångades först
+# i diffstaten — 3,1 MB binär på väg in i historiken.
+#
+# ⚠️ ASYMMETRI, medvetet noterad och INTE åtgärdad här: Windows-motsvarigheten
+# `whisper-cli-x86_64-pc-windows-msvc.exe` ÄR spårad. Om den är det av ett skäl
+# (lokala Windows-bygg) ska mac-filen kanske också vara det; om den ligger kvar
+# sedan innan GCS-pipelinen finns är den död vikt i historiken. Frågan hör inte
+# hemma i en release-commit.
+src-tauri/binaries/whisper-cli-aarch64-apple-darwin
 
 # whisper.cpp-exempelbinärer — används inte av appen (sidecar ligger i src-tauri/binaries/)
 src-tauri/whisper_temp/

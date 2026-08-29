@@ -1,13 +1,20 @@
 [package]
 name = "sagt"
-# Medvetet 0.0.0 — INTE appens version. tauri.conf.json:s `version` är sanningskällan
-# och vinner alltid när fältet finns där; detta fält läses varken av bundlern, av CI
-# eller av koden (inget env!("CARGO_PKG_VERSION") finns). Fältet stod tidigare på 0.9.5
-# medan appen var på 0.9.42, vilket bara gav "Compiling sagt v0.9.5" i byggloggarna och
-# fick folk att tro att versionerna glidit isär. Att i stället synka det manuellt hade
-# lagt till en fjärde fil att glömma vid varje bump — se desktop/CLAUDE.md om varför den
-# sortens duplicering redan orsakat tyst fel en gång (PostHogProvider).
-version = "0.0.0"
+# MÅSTE matcha tauri.conf.json:s `version`. Grindas av check_versions.py.
+#
+# Fältet stod länge på 0.0.0 med motiveringen att det "varken läses av bundlern, av CI
+# eller av koden". Den motiveringen var fel, uppmätt 2026-08-19: tauri-winres använder
+# CARGO_PKG_VERSION för STRÄNG-fältet FileVersion i Windows PE-resursen. En debug-binär
+# från 2026-06-09, när appen var 0.9.28 och detta fält stod på 0.9.5, rapporterade:
+#
+#     FileVersionRaw (binär)  = 0.9.28.0   <- tauri.conf.json, via tauri-build
+#     FileVersion    (sträng) = 0.9.5      <- HÄRIFRÅN
+#
+# Filegenskaper, supportfrågan "vilken version har du?" och SmartScreen-ryktet läser
+# strängen. Att hålla fältet utanför synken gjorde alltså inte problemet ofarligt — det
+# gjorde det osynligt. Rätt svar på en fil som måste vara i synk är att lägga den under
+# grinden, vilket den nu är.
+version = "0.10.0"
 description = "A Tauri App"
 authors = ["you"]
 edition = "2021"
@@ -42,8 +49,15 @@ num-traits = "0.2"
 rusqlite = { version = "0.31", features = ["bundled"] }
 serde_rusqlite = "0.35"
 chrono = { version = "0.4", features = ["serde"] }
+
+# 🔴 windows-craten är TARGET-GATAD. Låg den under [dependencies] byggde Cargo den
+# även på macOS, och bygget dog i det transitiva windows-future v0.2.1 med tolv
+# "cannot find ... in windows_core::imp" — INNAN vår egen kod ens nåddes. Felet såg
+# ut som ett beroendeproblem och var en saknad rad här. Uppmätt 2026-08-24.
+#
 # Direkt windows-dep för WASAPI-peakmetrar (audio_meter.rs). cpal drar in en egen
 # äldre windows-version transitivt — olika major-versioner samexisterar i Cargo.
+[target.'cfg(windows)'.dependencies]
 windows = { version = "0.61", features = [
     "Win32_Media_Audio",
     "Win32_Media_Audio_Endpoints",
@@ -52,6 +66,16 @@ windows = { version = "0.61", features = [
     "Win32_UI_Shell_PropertiesSystem",
     "Win32_Devices_FunctionDiscovery",
 ] }
+
+# Systemljud på macOS (mac_sysaudio.rs). objc2 och core-foundation finns redan
+# transitivt via cpal, men deklareras direkt här — en transitiv version är ingen
+# garanti och kan försvinna med en cpal-uppgradering.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", features = ["NSString", "NSArray", "NSValue"] }
+block2 = "0.6"
+core-foundation = "0.10"
+core-foundation-sys = "0.8"
 
 [features]
 devtools = ["tauri/devtools"]

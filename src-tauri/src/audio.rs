@@ -1005,9 +1005,16 @@ impl RecordingState {
 /// Aktiv WASAPI-loopback mot en specifik utgångsenhet. När strömmen droppas kopplas
 /// sample-kanalen ner, processor-tråden avslutar sin `for sample in rx`-loop och
 /// force-flushar pågående VAD-segment — gamla trådar städar alltså sig själva.
+/// Bäraren av den aktiva systemljudsfångsten. Windows använder cpal:s WASAPI-
+/// loopback, macOS en Core Audio-tap. Båda är RAII: drop = fångsten stoppar.
+#[cfg(not(target_os = "macos"))]
+type SysStream = cpal::Stream;
+#[cfg(target_os = "macos")]
+type SysStream = crate::mac_sysaudio::MacSysStream;
+
 struct SysCapture {
-    /// Håller cpal-strömmen vid liv; drop = stoppa fångsten.
-    _stream: cpal::Stream,
+    /// Håller strömmen vid liv; drop = stoppa fångsten.
+    _stream: SysStream,
     /// Enhetsnamnet vid bindning — jämförs mot aktuell default-utgång var 2 s.
     device_name: String,
     /// Sätts av cpal:s error-callback när endpointen invalideras → trigga rebind.
@@ -1060,6 +1067,7 @@ fn build_sys_capture(
 
 /// Försöker starta loopback-fångst mot exakt denna enhet — ingen fallback här;
 /// build_sys_capture äger fallback-beslutet.
+#[cfg(not(target_os = "macos"))]
 fn try_sys_capture(
     sys_device: cpal::Device,
     app: &AppHandle,
@@ -1118,6 +1126,108 @@ fn try_sys_capture(
     // Processor-tråden får nya enhetens samplerate → korrekt resample-ratio.
     // Kloner av samma session_tx/level_tx → MÖTET-segment och SessionChunks
     // fortsätter in i pågående session efter en rebind.
+    let app_handle_sys = app.clone();
+    let settings_sys = settings.clone();
+    let is_recording_sys = is_recording.clone();
+    let session_state_sys = session_state.clone();
+    let sys_level_tx = level_tx.clone();
+    let sys_session_tx = session_tx.clone();
+
+    thread::spawn(move || {
+        process_audio_stream(
+            sys_sample_rx,
+            sys_sample_rate,
+            "MÖTET",
+            app_handle_sys,
+            Some((sys_level_tx, false)),
+            settings_sys,
+            Some(("sys".to_string(), sys_session_tx)),
+            is_recording_sys,
+            session_state_sys,
+        );
+    });
+
+    Some(SysCapture { _stream: stream, device_name, failed })
+}
+
+/// macOS-motsvarigheten: Core Audio Taps i stället för WASAPI-loopback.
+///
+/// Kontraktet är identiskt med Windows-versionen — en `Sender<f32>` med
+/// kanalmedelvärdesbildade samples, en samplerate, och en RAII-guard — så allt
+/// nedströms (`process_audio_stream`, stereo-parningen, `extract_meeting_channel`,
+/// live-diariseringen) är orört.
+///
+/// Tappen binds till default-utgången internt, så `sys_device` styr inte VAD som
+/// fångas. Den används ändå — för sitt NAMN.
+///
+/// 🔴 `device_name` måste komma från cpal, inte från CoreAudios enhets-UID.
+/// Rebind-loopen jämför fältet mot `default_out_name`, som är cpal:s namn
+/// (`"MacBook Air Speakers"`). CoreAudios UID är en annan sträng
+/// (`"BuiltInSpeakerDevice"`), och med den i fältet blir jämförelsen ALLTID olika →
+/// `needs_rebind` alltid sant → tappen rivs och byggs om var annan sekund, för
+/// alltid. Kompilerar felfritt, låter förfärligt.
+#[cfg(target_os = "macos")]
+fn try_sys_capture(
+    sys_device: cpal::Device,
+    app: &AppHandle,
+    level_tx: &Sender<AudioInput>,
+    session_tx: &Sender<SessionChunk>,
+    settings: &Arc<Mutex<AudioSettings>>,
+    is_recording: &Arc<Mutex<bool>>,
+    session_state: &Arc<Mutex<SessionState>>,
+) -> Option<SysCapture> {
+    use crate::mac_sysaudio::{self, Permission};
+
+    // 🔴 Behörigheten läses FÖRE varje fångst, inte bara vid appstart. Användaren
+    // kan återkalla den i Systeminställningar mitt i en session, och utan
+    // behörighet nekar macOS HELT TYST: varje anrop returnerar noErr och varje
+    // sampel är 0.0. En nekad behörighet går alltså inte att skilja från ett tyst
+    // möte i efterhand — den skillnaden finns bara här.
+    match mac_sysaudio::preflight() {
+        Permission::Granted => {}
+        Permission::NotDetermined => {
+            // Dialogen visas asynkront. Vi väntar INTE på svaret: att blockera
+            // motorstarten på en behörighetsfråga vore att hålla mic-vägen gisslan.
+            // Nästa inspelning läser statusen och lyckas om användaren godkände.
+            println!("DEBUG: Ljudbehörighet ej beslutad — begär, fortsätter mic-only");
+            mac_sysaudio::request_permission();
+            return None;
+        }
+        Permission::Denied => {
+            eprintln!("DEBUG: Ljudbehörighet NEKAD — mic-only. Användaren måste slå på \
+                       den i Systeminställningar → Integritet och säkerhet");
+            return None;
+        }
+        Permission::Unknown => {
+            // TCC gick inte att fråga (privat API kan försvinna i en macOS-version).
+            // Försök ändå — ett misslyckat försök degraderar till mic-only ändå,
+            // och att vägra i förväg vore att göra en okänd status till ett nej.
+            eprintln!("DEBUG: Kunde inte läsa ljudbehörighet — försöker fånga ändå");
+        }
+    }
+
+    let (sys_sample_tx, sys_sample_rx) = unbounded::<f32>();
+    let failed = Arc::new(AtomicBool::new(false));
+
+    // Namnet tas från cpal så att rebind-jämförelsen blir äppel-mot-äppel.
+    // mac_sysaudio::start returnerar CoreAudio-UID:t, som bara loggas.
+    let device_name = sys_device.name().unwrap_or_default();
+
+    let (stream, sys_sample_rate, tap_device_uid) =
+        match mac_sysaudio::start(sys_sample_tx, failed.clone()) {
+            Ok(v) => v,
+            Err(e) => {
+                // Best-effort, samma semantik som Windows: systemljud som inte
+                // startar ger mic-only, aldrig en död motor.
+                eprintln!("DEBUG: Systemljud kunde inte startas (fortsätter mic-only): {}", e);
+                return None;
+            }
+        };
+    println!(
+        "DEBUG: Core Audio tap startad på {:?} (UID {:?}) @ {} Hz",
+        device_name, tap_device_uid, sys_sample_rate
+    );
+
     let app_handle_sys = app.clone();
     let settings_sys = settings.clone();
     let is_recording_sys = is_recording.clone();
@@ -1623,7 +1733,6 @@ fn transcribe(
     let my_gen = current_session_generation();
 
     tauri::async_runtime::spawn(async move {
-        use tauri_plugin_shell::ShellExt;
         
         let path_buf = std::path::PathBuf::from(&file_path);
         let path_str = path_buf.to_string_lossy().to_string();
@@ -1663,28 +1772,71 @@ fn transcribe(
          };
 
         // 2. Resolve model path
+        //
+        // 🔴 resource_dir() prövas FÖRST, och det är macOS-kravet: i en .app ligger
+        // binären i Contents/MacOS/ men resurserna i Contents/Resources/, så
+        // current_exe().parent() pekar fel. På Windows ligger de bredvid varandra och
+        // dagens layout råkar fungera — därför behålls de två gamla kandidaterna som
+        // fallback i stället för att ersättas. Windows-beteendet är då oförändrat och
+        // verifierbart, vilket det inte hade varit med ett rakt byte (Windows går inte
+        // att testa härifrån).
+        // Modellen ligger under <resource_dir>/resources/models/ — UPPMÄTT, inte
+        // antaget. `tauri.conf.json` deklarerar `resources: ["resources/models/*"]`
+        // och Tauri bevarar den relativa sökvägen. Bekräftat 2026-08-25 i den första
+        // byggda macOS-bundlen:
+        //
+        //     Sagt.ai.app/Contents/Resources/resources/models/ggml-kb-whisper-small.bin
+        //
+        // En tidigare version prövade även <resource_dir>/models/ som gardering mot
+        // att gissningen var fel. Den varianten är nu bevisat död och struken —
+        // en kandidat som aldrig kan träffa gör bara felmeddelandet svårare att läsa.
+        //
+        // Detta är macOS-kravet: i en .app ligger binären i Contents/MacOS/ men
+        // resurserna i Contents/Resources/, så current_exe().parent() pekar fel.
+        // De två app_dir-kandidaterna nedan behålls för Windows, där layouten är platt.
+        let path_resource_dir = handle
+            .path()
+            .resource_dir()
+            .ok()
+            .map(|d| d.join("resources").join("models").join("ggml-kb-whisper-small.bin"));
         let path_root = app_dir.join("models").join("ggml-kb-whisper-small.bin");
         let path_resources = app_dir.join("resources").join("models").join("ggml-kb-whisper-small.bin");
 
-        let mut model_path_buf = if path_root.exists() {
-            path_root.clone()
-        } else if path_resources.exists() {
-            path_resources.clone()
-        } else {
-            path_root.clone()
+        // `mut` behövs av `#[cfg(debug_assertions)]`-blocket nedanför, som skriver om
+        // sökvägen i utvecklingsläge. I release är blocket bortkompilerat och bindningen
+        // aldrig muterad — därav allow. Utan den varnar ENDAST release-bygget, och
+        // `cargo check` (debugprofilen) kan strukturellt aldrig se det.
+        #[allow(unused_mut)]
+        let mut model_path_buf = match &path_resource_dir {
+            Some(p) if p.exists() => p.clone(),
+            _ if path_root.exists() => path_root.clone(),
+            _ if path_resources.exists() => path_resources.clone(),
+            _ => path_root.clone(),
         };
         
         // Development fallback — excluded from release builds entirely
         #[cfg(debug_assertions)]
         if !model_path_buf.exists() {
-             let fallback = std::path::PathBuf::from("d:/Programering/swedish-whisper-engine/desktop/src-tauri/resources/models/ggml-kb-whisper-small.bin");
+             // Härledd ur CARGO_MANIFEST_DIR i stället för en hårdkodad Windows-sökväg.
+             // Fungerar på båda plattformarna och följer med om repot flyttas.
+             let fallback = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                 .join("resources").join("models").join("ggml-kb-whisper-small.bin");
              if fallback.exists() {
                  model_path_buf = fallback;
              }
         }
 
         if !model_path_buf.exists() {
-             let err_msg = format!("Modell saknas. Letade i: '{}' OCH '{}'", path_root.display(), path_resources.display());
+             // Felmeddelandet listar ALLA sökta sökvägar. Utan resource_dir-posten
+             // hade macOS-felet utelämnat just den sökväg som är den primära där.
+             let mut candidates: Vec<String> = Vec::new();
+             if let Some(p) = &path_resource_dir {
+                 candidates.push(format!("'{}'", p.display()));
+             }
+             candidates.push(format!("'{}'", path_root.display()));
+             candidates.push(format!("'{}'", path_resources.display()));
+             let searched = candidates.join(", ");
+             let err_msg = format!("Modell saknas. Letade i: {}", searched);
              println!("ERROR: {}", err_msg);
              let _ = handle.emit("transcription-error", err_msg);
              let mut state = session_state_clone.lock().unwrap();
@@ -1701,8 +1853,6 @@ fn transcribe(
             resource_path_str.to_string()
         };
         
-        let shell = handle.shell();
-        
         // 3. Resolve binaries/DLL path and Sidecar Executable Path
         let dll_path_portable = app_dir.join("binaries");
         let dll_path_root = app_dir.to_path_buf();
@@ -1713,7 +1863,22 @@ fn transcribe(
                     let path = entry.path();
                     if path.is_file() {
                         if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                            if name.starts_with("whisper-cli") && name.ends_with(".exe") {
+                            // Sidecarns filändelse är plattformsberoende: Tauri lägger
+                            // whisper-cli.exe på Windows och whisper-cli utan ändelse på macOS.
+                            //
+                            // 🔴 Kravet på icke-Windows är att namnet INTE slutar på .exe —
+                            // inte att ändelsen är tom. `ends_with("")` är alltid sant, och
+                            // repots binaries/ innehåller BÅDE whisper-cli-aarch64-apple-darwin
+                            // och den committade whisper-cli-x86_64-pc-windows-msvc.exe. Med
+                            // ett tomt suffix matchade båda, och read_dir-ordningen är
+                            // filsystemberoende — appen kunde alltså plocka Windows-binären på
+                            // macOS, icke-deterministiskt.
+                            let matches_platform = if cfg!(windows) {
+                                name.ends_with(".exe")
+                            } else {
+                                !name.ends_with(".exe")
+                            };
+                            if name.starts_with("whisper-cli") && matches_platform {
                                 return Some(path);
                             }
                         }
@@ -1723,20 +1888,26 @@ fn transcribe(
             None
         };
 
+        // Samma skäl som för model_path_buf ovan: båda muteras bara av
+        // `#[cfg(debug_assertions)]`-blocket längre ned.
+        #[allow(unused_mut)]
         let (mut dll_path, mut sidecar_exe_path) = if let Some(exe) = find_whisper_cli(&dll_path_portable) {
             (dll_path_portable.clone(), exe)
         } else if let Some(exe) = find_whisper_cli(&dll_path_root) {
             (dll_path_root.clone(), exe)
         } else {
-            (dll_path_portable.clone(), dll_path_portable.join("whisper-cli-fallback.exe"))
+            (dll_path_portable.clone(), dll_path_portable.join(
+                if cfg!(windows) { "whisper-cli-fallback.exe" } else { "whisper-cli-fallback" }))
         };
 
         // Development fallback — excluded from release builds entirely
         #[cfg(debug_assertions)]
         if !sidecar_exe_path.exists() || !dll_path.exists() {
-             let fallback_dll = std::path::PathBuf::from("d:/Programering/swedish-whisper-engine/desktop/src-tauri/binaries");
-             let fallback_exe = fallback_dll.join("whisper-cli-x86_64-pc-windows-msvc.exe");
-             if fallback_exe.exists() {
+             // Härledd ur CARGO_MANIFEST_DIR, och binären SÖKS UPP i stället för att
+             // namnges — namnet skiljer sig per target-triple och en hårdkodad
+             // Windows-triple hade aldrig träffat på macOS.
+             let fallback_dll = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("binaries");
+             if let Some(fallback_exe) = find_whisper_cli(&fallback_dll) {
                  dll_path = fallback_dll;
                  sidecar_exe_path = fallback_exe;
              }

@@ -2,7 +2,9 @@
 
 **Free, private meeting transcription for Swedish. Runs on your own machine.**
 
-[Download for Windows →](https://downloads.sagt.ai/Sagt.ai-setup.exe) · [sagt.ai](https://sagt.ai) · Windows 10/11 · 165 MB · MIT licensed
+[Download for Windows →](https://downloads.sagt.ai/Sagt.ai-setup.exe) (172 MB) · [Download for Mac →](https://downloads.sagt.ai/Sagt.ai-arm64.dmg) (178 MB)
+
+[sagt.ai](https://sagt.ai) · Windows 10/11 · macOS 14.2+ (Apple Silicon) · MIT licensed
 
 ![Sagt.ai Desktop — real-time Swedish transcription](assets/screenshot.png)
 
@@ -77,11 +79,11 @@ This repository exists so you don't have to take our word for any of the above. 
 | Error reports contain no transcript text | [`src/lib/error-slug.ts`](src/lib/error-slug.ts) |
 | What is sent to analytics | Search the source for `posthog.capture` |
 
-You can also watch the network yourself: Windows Task Manager → Resource Monitor → Network, while a local transcription runs.
+You can also watch the network yourself while a local transcription runs: Task Manager → Resource Monitor → Network on Windows, or Activity Monitor → Network on a Mac.
 
 ## Privacy — what leaves your machine
 
-**In local mode, your audio and transcripts never leave your machine.** Recordings are transcribed on your own CPU by a bundled KB-Whisper model — nothing is uploaded, and there is no cloud round-trip. That is the promise that matters, and you can verify it yourself in Windows Task Manager → Resource Monitor → Network, or any network monitoring tool: no audio ever crosses the wire. The audio pipeline source is [`src-tauri/src/audio.rs`](src-tauri/src/audio.rs).
+**In local mode, your audio and transcripts never leave your machine.** Recordings are transcribed on your own CPU by a bundled KB-Whisper model — nothing is uploaded, and there is no cloud round-trip. That is the promise that matters, and you can verify it yourself in Resource Monitor on Windows, Activity Monitor on a Mac, or any network monitoring tool: no audio ever crosses the wire. The audio pipeline source is [`src-tauri/src/audio.rs`](src-tauri/src/audio.rs).
 
 The app is **not** network-silent, though, and we would rather say so plainly than have you discover it in Resource Monitor. It also:
 
@@ -109,7 +111,7 @@ We hold **neither ISO 27001 nor SOC 2**, and do not claim to. What we offer inst
 
 Stated plainly, so you can decide before downloading:
 
-- **Windows only.** No macOS or Linux build exists.
+- **Apple Silicon Macs only.** The Mac build is arm64 — there is no Intel Mac build and no universal binary. macOS 14.2 or later is required, because the API used to capture meeting audio does not exist before it. No Linux build exists.
 - **No file export.** Transcripts and summaries are copied to the clipboard; PDF and Word export are not implemented yet.
 - **Swedish-first.** The bundled on-device model handles Swedish only. Norwegian and English are available through the cloud tier (Pro).
 - **Public beta.** Expect rough edges.
@@ -138,18 +140,26 @@ The on-device model is Swedish. Norwegian (NB-Whisper) and English (Whisper larg
 No. It installs per-user, which means it works on a managed work laptop.
 
 **Is there a Mac version?**
-No. Windows 10/11 only.
+Yes, since v0.10.0 — the same app, released from the same version tag as Windows. It needs macOS 14.2 or later on an Apple Silicon Mac (M1 or newer); Intel Macs are not supported.
 
 **Can I export to Word or PDF?**
 Not yet — text is copied to the clipboard.
 
 ## Installation
 
-**Requires Windows 10 or 11 (64-bit).** There is no macOS or Linux build.
+**Windows 10 or 11 (64-bit)**, or **macOS 14.2+ on an Apple Silicon Mac**. There is no Intel Mac build and no Linux build.
 
-1. [Download the signed Windows installer](https://downloads.sagt.ai/Sagt.ai-setup.exe) (165 MB)
+### Windows
+
+1. [Download the signed installer](https://downloads.sagt.ai/Sagt.ai-setup.exe) (172 MB)
 2. Run `Sagt.ai-setup.exe` — signed with Azure Trusted Signing, so Windows shows a verified publisher: **EDI Labs AB**. No administrator rights needed
 3. Launch Sagt.ai and start recording — no account, no email address
+
+### macOS
+
+1. [Download the disk image](https://downloads.sagt.ai/Sagt.ai-arm64.dmg) (178 MB)
+2. Open it and drag Sagt.ai to Applications. The app is signed with an Apple Developer ID and notarised by Apple, so it opens without a security warning — including on a machine that is offline
+3. On first launch macOS asks for microphone access, and for system audio the first time you record a meeting. Both are needed for the other participants to be captured
 
 The app auto-updates in the background when a new version is available.
 
@@ -178,16 +188,18 @@ npx tsc --noEmit
 
 ## Tech stack
 
-- [Tauri v2](https://tauri.app) (Rust + WebView2)
+- [Tauri v2](https://tauri.app) (Rust + WebView2 on Windows, WKWebView on macOS)
 - React + TypeScript + Tailwind CSS
 - [KB-Whisper](https://huggingface.co/KBLab) via local `whisper-cli` sidecar (beam-size 1, VAD-gated)
-- WASAPI loopback capture for system audio (microphone + meeting audio as separate channels)
+- System audio captured as a channel separate from the microphone — WASAPI loopback on Windows, Core Audio taps on macOS
 - SQLite for local recording storage
 - Cloud tier: KB-Whisper Large and Llama 3.3 via [Berget.ai](https://berget.ai) (Swedish servers), speaker diarization via pyannoteAI
 
 ---
 
 ## Changelog
+
+**v0.10.0** — Sagt.ai runs on the Mac. It is the same app as on Windows, released from the same version tag: recording, on-device transcription with KB-Whisper, and meeting audio from Teams, Zoom and Meet — still with no bot joining the call. It needs macOS 14.2 or later on an Apple Silicon Mac; the 14.2 floor comes from the API used to capture system audio, and Intel Macs are not supported. The build is notarised by Apple, so it opens without a security warning even offline. On first launch macOS asks for the microphone, and for system audio the first time you record a meeting — both are needed for the rest of the meeting to be captured. The download page now offers the right file for the computer you are on, with both available either way.
 
 **v0.9.44** — the upgrade flow stops losing track of your payment. If Stripe took longer than five minutes to confirm, the app used to give up quietly and drop you back on the price list — and the "I've paid, refresh now" button disappeared along with it, leaving someone who had just paid with nothing to click. That state now survives the timeout: the refresh button stays, you can reopen the payment, and once it goes through you get a confirmation instead of being shown the price list again with a "Pro activated!" headline above it. If you're offline, the app now says it couldn't check rather than reporting that no subscription was found — the old wording could talk someone who had already paid into paying twice. Behind that: the app used to ask our server for your subscription status every 60 seconds it was open, which kept a server instance awake around the clock for no good reason. It now checks at startup, when you bring the window into focus, and every half hour otherwise. The practical difference is that if your subscription changes elsewhere, the app may take a little longer to notice.
 
@@ -201,7 +213,7 @@ npx tsc --noEmit
 
 ## Contributing
 
-See [CONTRIBUTING.md](CONTRIBUTING.md). Windows is the primary platform; Mac PRs are welcome but review time is not guaranteed.
+See [CONTRIBUTING.md](CONTRIBUTING.md). Windows and macOS are both supported and ship from the same tag; Linux and Intel Mac PRs are welcome but review time is not guaranteed.
 
 Security issues: see [SECURITY.md](SECURITY.md) — please do not open public issues for vulnerabilities.
 
