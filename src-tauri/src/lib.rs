@@ -1,4 +1,5 @@
 // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
+pub mod applog;
 mod audio;
 mod audio_meter;
 /// Systemljud via Core Audio Taps. All osäker CoreAudio-FFI är isolerad här,
@@ -319,6 +320,22 @@ fn cleanup_audio_storage(
 pub fn run() {
     tauri::Builder::default()
         .setup(|app| {
+            // 🔴 FÖRST av allt. Allt som skrivs före den här raden går till /dev/null
+            // i en GUI-startad app, inklusive felen från uppstädningen nedan — och
+            // det är just uppstartsutskrifterna man vill ha när något går fel tidigt.
+            //
+            // Ett misslyckande här får inte hindra appen från att starta: en app som
+            // vägrar köra för att loggfilen inte gick att öppna vore ett sämre fel än
+            // det den ska göra felsökbart. Vi skriver därför bara vidare till den
+            // ström som ändå finns.
+            match app.path().app_data_dir() {
+                Ok(dir) => match applog::init(&dir) {
+                    Ok(path) => println!("DEBUG: Loggfil: {}", path.display()),
+                    Err(e) => eprintln!("DEBUG: Kunde inte starta filloggning: {e}"),
+                },
+                Err(e) => eprintln!("DEBUG: Ingen app-datakatalog för loggen: {e}"),
+            }
+
             // Kill any zombie whisper-cli processes from previous runs
             #[cfg(target_os = "windows")]
             {

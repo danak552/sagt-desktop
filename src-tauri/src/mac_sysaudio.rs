@@ -122,6 +122,10 @@ const K_SCOPE_GLOBAL: u32 = fcc(b"glob");
 const K_SCOPE_INPUT: u32 = fcc(b"inpt");
 const K_DEFAULT_OUTPUT_DEVICE: u32 = fcc(b"dOut");
 const K_DEVICE_UID: u32 = fcc(b"uid ");
+// kAudioDevicePropertyDeviceIsRunningSomewhere — "kör enheten för NÅGON i systemet".
+// Inte `goin` (kAudioDevicePropertyDeviceIsRunning), som bara svarar för den
+// egna klienten och alltid är 0 innan vi startat något själva.
+const K_DEVICE_RUNNING_SOMEWHERE: u32 = fcc(b"gone");
 const K_SYSTEM_OBJECT: AudioObjectID = 1;
 const K_ELEM_MAIN: u32 = 0;
 
@@ -301,6 +305,72 @@ impl Drop for MacSysStream {
             }
         }
     }
+}
+
+/// Spelar utenheten just nu, för någon process i systemet?
+///
+/// 🔴 Detta är en FÖRUTSÄTTNING för att tappen ska kunna starta, inte en optimering.
+/// Uppmätt på macOS 26.6.1 2026-08-30: med tyst utgång blockerar `AudioDeviceStart`
+/// på aggregatet i ~15 sekunder och faller sedan med `Error: 0x3C` (ETIMEDOUT).
+/// Loggen visar varför — aggregatets IO-tråd startar först när högtalaren gör det:
+///
+/// ```text
+/// 09:04:08  aggregatet registreras
+/// 09:04:23  StartIOThread: Error: 0x3C          <- 15 s timeout
+/// 09:04:29  IOWorkLoopInit: BuiltInSpeakerDevice (ai.sagt.motet.aggregate): starting
+/// 09:04:29  + Speaker::startIOEngineGated()     <- ljud börjar spelas
+/// 09:04:29  Digital Mic Start of IO result 0    <- allt släpper
+/// ```
+///
+/// En tap på en vilande utenhet har ingen klocka att haka i. Att ändå försöka kostade
+/// ~15 s blockering per försök, ett aggregat per försök, en sömnspärr — och rev
+/// mikrofonen ur pågående inspelningar, eftersom högtalare och Digital Mic delar
+/// I2S-motor på Apple Silicon.
+///
+/// Vid fel returneras `true`: en oläsbar egenskap ska ge ett försök, inte en tyst
+/// blockering av MÖTET för alltid. Felvägen nedströms degraderar redan till mic-only.
+pub fn output_is_active() -> bool {
+    let addr = AudioObjectPropertyAddress {
+        selector: K_DEFAULT_OUTPUT_DEVICE,
+        scope: K_SCOPE_GLOBAL,
+        element: K_ELEM_MAIN,
+    };
+    let mut dev: AudioObjectID = 0;
+    let mut size = std::mem::size_of::<AudioObjectID>() as u32;
+    let st = unsafe {
+        AudioObjectGetPropertyData(
+            K_SYSTEM_OBJECT,
+            &addr,
+            0,
+            std::ptr::null(),
+            &mut size,
+            &mut dev as *mut _ as *mut c_void,
+        )
+    };
+    if st != 0 || dev == 0 {
+        return true;
+    }
+    let addr = AudioObjectPropertyAddress {
+        selector: K_DEVICE_RUNNING_SOMEWHERE,
+        scope: K_SCOPE_GLOBAL,
+        element: K_ELEM_MAIN,
+    };
+    let mut running: u32 = 0;
+    let mut size = std::mem::size_of::<u32>() as u32;
+    let st = unsafe {
+        AudioObjectGetPropertyData(
+            dev,
+            &addr,
+            0,
+            std::ptr::null(),
+            &mut size,
+            &mut running as *mut _ as *mut c_void,
+        )
+    };
+    if st != 0 {
+        return true;
+    }
+    running != 0
 }
 
 fn default_output_uid() -> Result<CFString, String> {

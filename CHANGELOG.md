@@ -7,6 +7,26 @@ Changeloggen börjar vid 0.9.41. Äldre versioner finns inte dokumenterade här.
 
 ---
 
+## 0.10.1 — 2026-08-30
+
+### Fixat
+
+- **Inspelningar som inte gav något.** På Mac kunde mikrofonen låta bli att starta
+  om inget annat ljud spelades på datorn. Inspelningen såg ut att komma igång, men
+  gav varken ljudnivåer eller text, och den orange mikrofonsymbolen dök aldrig upp
+  i menyraden. Började något spela — en video, ett möte — vaknade den plötsligt
+  mitt i. Ett nytt försök fungerade ofta, vilket gjorde felet svårt att känna igen.
+
+  Mikrofonen startar nu direkt, oavsett om något annat låter.
+
+### Ändrat
+
+- **Appen sparar en loggfil** under `Bibliotek/Application Support/com.sagt.ai/logs/`.
+  Den beskriver vad appen gör — vilka ljudenheter som används och när något
+  misslyckas — så att ett fel går att felsöka i efterhand i stället för att behöva
+  återskapas. **Den innehåller aldrig ditt ljud och aldrig texten ur dina
+  inspelningar.** Filen roterar vid 5 MB och lämnar aldrig datorn av sig själv.
+
 ## 0.10.0 — 2026-08-29
 
 ### Nytt

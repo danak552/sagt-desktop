@@ -290,10 +290,51 @@ impl AudioMonitor {
             // loopen nedan när Windows byter utgång (hörlurar i/ur) eller när WASAPI
             // invaliderar endpointen — annars fortsätter fångsten mot en död enhet och
             // MÖTET-kanalen blir tyst trots att mic fungerar.
-            let mut sys_capture = build_sys_capture(
-                &host, &app, &level_tx, &session_tx, &settings, &is_recording, &session_state,
-                None,
-            );
+            //
+            // 🔴 Även DEN HÄR byggnaden grindas mot en vilande utgång, inte bara
+            // ombyggnaderna i loopen nedan. Grinden satt först enbart i `needs_rebind`,
+            // och den luckan var hela felet: appen skapade tappen EN gång vid start,
+            // mot en tyst utgång, och den vägde fast den delade ljudmotorn.
+            //
+            // Uppmätt i apploggen 2026-08-30, med ~40 sekunder mellan raderna:
+            //
+            //     13:22:10.833  Core Audio tap startad på "Högtalare i MacBook Air"
+            //     13:22:12.684  Selected input device: "MacBook Air-mikrofon"
+            //     ...ingenting på 34 sekunder — build_mic_capture BLOCKERADE...
+            //     13:22:47.013  Mic stream started      <- bakgrundsljud startade just då
+            //
+            // På Apple Silicon delar högtalare och Digital Mic samma I2S-motor. En tap
+            // som väntar på att en vilande utgång ska starta hindrar därmed mikrofonens
+            // `AudioDeviceStart` från att returnera. Två inspelningar i rad blev tysta:
+            // reconcile-loopen satt fast i anropet från den första.
+            //
+            // Konsekvensen av att avstå är ingen: en tyst utgång har inget mötesljud att
+            // fånga, och loopen bygger tappen inom två sekunder efter att ljud börjar.
+            //
+            // ⚠️ KVARVARANDE RISK, medvetet inte åtgärdad här. Grinden gör felet
+            // sällsynt, inte omöjligt: är utgången kort aktiv när pollen körs (ett
+            // notisljud) startar bygget, och tystnar utgången under tiden blockerar
+            // `AudioDeviceStart` sina ~15 sekunder på samma tråd som öppnar mikrofonen.
+            // En inspelning som startas i det fönstret får mikrofonen först vid nästa
+            // varv — samma symptom som i dag, bara med ett smalare tidsfönster.
+            //
+            // Den strukturella fixen är att bygga systemfångsten på en EGEN tråd, så att
+            // en blockerande CoreAudio-start aldrig kan ligga i vägen: mikrofonen är den
+            // obligatoriska kanalen och får aldrig vara gisslan hos den valfria. Det
+            // kräver att `SysCapture` blir `Send` (den håller råa CoreAudio-pekare), och
+            // gjordes inte i samma ändring som den här eftersom det inte gick att
+            // runtime-verifiera i samma session.
+            let mut sys_capture = if sys_capture_worth_attempting() {
+                build_sys_capture(
+                    &host, &app, &level_tx, &session_tx, &settings, &is_recording,
+                    &session_state, None,
+                )
+            } else {
+                println!(
+                    "DEBUG: Utgången är vilande vid start — MÖTET-tappen byggs när ljud spelas"
+                );
+                None
+            };
 
              // --- Main Loop: Aggregating Levels & Keeping Alive ---
              let mut current_mic = 0.0;
@@ -345,6 +386,24 @@ impl AudioMonitor {
              // Endpoint vars pinned-bind nyss misslyckades (t.ex. HFP-endpoint som
              // vägrar loopback) — karantän så att metersvepet inte retry-loopar den.
              let mut pinned_quarantine: Option<(String, Instant)> = None;
+             // 🔴 Backoff när MÖTET-fångsten upprepat vägrar starta. Utan den bygger
+             // loopen om var 2:e sekund för alltid: `(SysTarget::Default, None)`-armen
+             // i `needs_rebind` nedan är sann så länge fångsten saknas och en utenhet
+             // finns, och den varken räknar försök eller väntar.
+             //
+             // Uppmätt på macOS 26.6.1 2026-08-30, app v0.10.0: varje misslyckat
+             // försök skapar ett nytt aggregat som blockerar ~14 s på CoreAudios
+             // starttimeout (`Error: 0x3C` = ETIMEDOUT) innan det ger upp. Följden
+             // blev 53 `ai.sagt.motet.aggregate` på tre timmar, IO-kontexter som
+             // hölls kvar tills appen avslutades, och en `preventuseridlesleep`-spärr
+             // som hindrade datorn från att somna medan appen var overksam.
+             //
+             // Värst var kollateralskadan: aggregatchurnen rev mikrofonen ur
+             // pågående inspelningar. Sessionen blev då 0,5 s tystnad — under
+             // MIN_RECORDING_DURATION_MS, alltså tyst kasserad utan felmeddelande.
+             // Fem av nio inspelningar föll så innan orsaken var känd.
+             let mut sys_fail_streak: u32 = 0;
+             let mut sys_retry_at: Option<Instant> = None;
 
              loop {
                 if !*is_running.lock().unwrap() {
@@ -613,7 +672,13 @@ impl AudioMonitor {
                         (_, Some(cap)) if cap.failed.load(Ordering::SeqCst) => true,
                         (SysTarget::Default, Some(cap)) =>
                             default_out_name.as_deref() != Some(cap.device_name.as_str()),
-                        (SysTarget::Default, None) => default_out_name.is_some(),
+                        // Backoff gäller BARA den här armen: den är den enda som är
+                        // sann enbart för att fångsten saknas. De andra utlöses av en
+                        // faktisk händelse (failed-flagga, bytt utenhet) och ska gå
+                        // igenom direkt. `force_sys_rebind` går också före backoffen.
+                        (SysTarget::Default, None) => default_out_name.is_some()
+                            && sys_rebuild_allowed(sys_retry_at, Instant::now())
+                            && sys_capture_worth_attempting(),
                         (SysTarget::Pinned(_), _) => false,
                     };
                     if needs_rebind {
@@ -637,6 +702,25 @@ impl AudioMonitor {
                             &host, &app, &level_tx, &session_tx, &settings, &is_recording, &session_state,
                             pinned_name.as_deref(),
                         );
+                        if sys_capture.is_some() {
+                            if sys_fail_streak > 0 {
+                                println!(
+                                    "DEBUG: MÖTET-fångsten igång igen efter {} misslyckade försök",
+                                    sys_fail_streak
+                                );
+                            }
+                            sys_fail_streak = 0;
+                            sys_retry_at = None;
+                        } else {
+                            sys_fail_streak = sys_fail_streak.saturating_add(1);
+                            let wait = sys_retry_backoff(sys_fail_streak);
+                            sys_retry_at = Some(Instant::now() + wait);
+                            println!(
+                                "DEBUG: MÖTET-fångsten kunde inte startas ({} i rad) — nytt försök om {} s",
+                                sys_fail_streak,
+                                wait.as_secs()
+                            );
+                        }
                         // Pinned-bind som misslyckades eller föll tillbaka till default →
                         // återgå till Default och sätt endpointen i karantän så att
                         // metersvepet inte retry-loopar en endpoint som vägrar loopback
@@ -677,6 +761,25 @@ impl AudioMonitor {
                             // falskt eller undertrycker en äkta varning. Ingen kod får
                             // hamna mellan new() och den här raden.
                             last_sys_audible = Instant::now();
+                            // Start-kanten ger ETT färskt försök: backoffen finns för att
+                            // skydda en overksam app mot aggregat-churn, inte för att neka en
+                            // användare som just tryckt på inspelning.
+                            //
+                            // 🔴 Bara väntetiden nollas — streaken lämnas orörd med avsikt.
+                            // Nollställs även den börjar trappan om på 5 s, och eftersom varje
+                            // försök blockerar ~14 s i AudioDeviceStart blir det fyra aggregat
+                            // under inspelningens första två minuter. Det är exakt den churn
+                            // som river mikrofonen ur en pågående session, alltså felet fixen
+                            // finns för — återinfört i det läge där det skadar mest. Med
+                            // streaken kvar går ett misslyckat försök direkt tillbaka till
+                            // den väntetid som redan var uppnådd.
+                            if sys_capture.is_none() && sys_retry_at.is_some() {
+                                println!(
+                                    "DEBUG: Inspelning startad — ger MÖTET ett försök till (streak {} kvar)",
+                                    sys_fail_streak
+                                );
+                            }
+                            sys_retry_at = None;
                             // Pre-flight: startar inspelningen helt utan loopback finns
                             // inget att vänta på — varna omedelbart.
                             if sys_capture.is_none() {
@@ -823,8 +926,20 @@ fn build_mic_capture(
         cpal::SampleFormat::U16 => run_stream::<u16>(&mic_device, &mic_config.clone().into(), mic_sample_tx, Some(failed.clone())),
         fmt => return Err(format!("Ljudformatet stöds inte: {:?}", fmt)),
     };
-    let stream = mic_stream_res.map_err(|e| format!("Kunde inte skapa mikrofonström: {}", e))?;
-    stream.play().map_err(|e| format!("Kunde inte starta mikrofonström: {}", e))?;
+    // Felen loggas OCH returneras. Returvärdet blir en toast för användaren;
+    // loggraden är det enda som ger tidpunkt och enhetsnamn, och därmed det enda
+    // som går att korrelera mot systemets egen ljudlogg vid en efterhandsanalys.
+    // Utan den syns bara att något gick fel, aldrig mot vilken enhet eller när.
+    let stream = mic_stream_res.map_err(|e| {
+        let msg = format!("Kunde inte skapa mikrofonström: {}", e);
+        eprintln!("DEBUG: {} (enhet {:?})", msg, device_name);
+        msg
+    })?;
+    stream.play().map_err(|e| {
+        let msg = format!("Kunde inte starta mikrofonström: {}", e);
+        eprintln!("DEBUG: {} (enhet {:?})", msg, device_name);
+        msg
+    })?;
     println!("DEBUG: Mic stream started on {:?}", device_name);
 
     // Processor-tråden får nya enhetens samplerate → korrekt resample-ratio.
@@ -1011,6 +1126,66 @@ impl RecordingState {
 type SysStream = cpal::Stream;
 #[cfg(target_os = "macos")]
 type SysStream = crate::mac_sysaudio::MacSysStream;
+
+/// Väntetid innan MÖTET-fångsten får försöka igen efter ett misslyckande.
+///
+/// 5 s → 15 s → 60 s → tak 5 min. Taket finns för att ett fel som inte går över
+/// av sig själv (ingen utenhet, nekad TCC, trasig drivrutin) annars kostar ett
+/// aggregat var 14:e sekund resten av sessionen.
+/// Får MÖTET-fångsten byggas om nu, givet backoffen?
+///
+/// Egen ren funktion i stället för ett inline-villkor: grinden satt tidigare mitt
+/// i en flerahundraradersloop och gick bara att verifiera genom att köra appen och
+/// vänta på att felet skulle inträffa. Nu går den att testa.
+fn sys_rebuild_allowed(retry_at: Option<Instant>, now: Instant) -> bool {
+    retry_at.map_or(true, |t| now >= t)
+}
+
+/// Är det meningsfullt att försöka bygga MÖTET-fångsten just nu?
+///
+/// På macOS: nej om utenheten är vilande. En Core Audio-tap på en tyst utgång har
+/// ingen klocka att haka i, så `AudioDeviceStart` blockerar ~15 s och faller med
+/// `Error: 0x3C`. Se `mac_sysaudio::output_is_active` för mätningen.
+///
+/// Det är inte en förlust: är utgången tyst finns per definition inget mötesljud att
+/// fånga. Nästa 2s-poll bygger fångsten så snart något börjar spelas, vilket är
+/// precis vad användaren såg — MÖTET slog igång i samma stund som en video startade.
+///
+/// På Windows finns inte problemet: WASAPI-loopback binder mot endpointen oavsett om
+/// någon spelar, så där svarar funktionen alltid ja och beteendet är oförändrat.
+///
+/// ⚠️ KÄND LUCKA, medvetet accepterad: upptäckten sker via 2s-pollen, så i ett möte
+/// som varit helt tyst kan upp till två sekunder av den första repliken klippas —
+/// utenheten startar när någon talar, men tappen byggs först vid nästa poll.
+///
+/// Det är ändå klart bättre än före ändringen, då samma scenario gav 15 s blockering,
+/// noll mötesljud OCH en riven mikrofon. Men luckan är en permanent egenskap och står
+/// därför skriven här i stället för att upptäckas av en kund som undrar var första
+/// meningen tog vägen.
+///
+/// Rätt lösning är en `AudioObjectAddPropertyListener` på
+/// `kAudioDevicePropertyDeviceIsRunningSomewhere`, som fyrar i samma ögonblick enheten
+/// startar i stället för upp till två sekunder senare. Den är inte gjord här eftersom
+/// den kräver en callback in i övervakningsloopen och inte gick att runtime-verifiera
+/// i samma session som resten av fixen.
+#[cfg(target_os = "macos")]
+fn sys_capture_worth_attempting() -> bool {
+    crate::mac_sysaudio::output_is_active()
+}
+
+#[cfg(not(target_os = "macos"))]
+fn sys_capture_worth_attempting() -> bool {
+    true
+}
+
+fn sys_retry_backoff(streak: u32) -> Duration {
+    match streak {
+        0 | 1 => Duration::from_secs(5),
+        2 => Duration::from_secs(15),
+        3 => Duration::from_secs(60),
+        _ => Duration::from_secs(300),
+    }
+}
 
 struct SysCapture {
     /// Håller strömmen vid liv; drop = stoppa fångsten.
@@ -2057,7 +2232,23 @@ fn transcribe(
 
                             // Filter out common whisper boilerplate if NO timestamps were parsed
                             if !final_text.is_empty() && !final_text.starts_with("whisper_") && !final_text.starts_with("system_info:") {
-                                println!("DEBUG: Streaming text: {}", final_text);
+                                // 🔴 LOGGA ALDRIG TRANSKRIBERAT INNEHÅLL. Raden skrev
+                                // tidigare ut hela `final_text`, och sedan filloggningen
+                                // infördes hamnade mötesinnehållet därmed i en fil på
+                                // disk. Den stannar visserligen lokalt, men en användare
+                                // som bifogar loggen i ett supportärende hade skickat oss
+                                // sitt möte — och hela produktlöftet är att transkriptet
+                                // är deras. Teckenantalet ger samma diagnostiska svar
+                                // (kom det text tillbaka, och hur mycket) utan innehållet.
+                                //
+                                // Samma regel gäller varje framtida loggrad: `error-slug.ts`
+                                // rapporterar av samma skäl en stabil kod och aldrig fri
+                                // feltext. Loggen får beskriva att något hände, aldrig vad
+                                // som sades.
+                                println!(
+                                    "DEBUG: Streaming text: {} tecken",
+                                    final_text.chars().count()
+                                );
                                 
                                 if !full_segment_text.is_empty() {
                                     full_segment_text.push(' ');
@@ -2671,4 +2862,50 @@ pub async fn delete_diarize_temp(app: AppHandle, path: String) -> Result<(), Str
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{sys_rebuild_allowed, sys_retry_backoff};
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn backoff_utan_vantan_slapper_igenom() {
+        // Normalfallet: ingen backoff satt → ombyggnad tillåten.
+        assert!(sys_rebuild_allowed(None, Instant::now()));
+    }
+
+    #[test]
+    fn backoff_i_framtiden_blockerar() {
+        // Det här är felet fixen finns för. Utan den här spärren byggde loopen om
+        // var 2:e sekund för alltid, och varje försök kostade ett aggregat och
+        // ~14 s CoreAudio-timeout.
+        let now = Instant::now();
+        assert!(!sys_rebuild_allowed(Some(now + Duration::from_secs(30)), now));
+    }
+
+    #[test]
+    fn backoff_som_lopt_ut_slapper_igenom() {
+        let now = Instant::now();
+        assert!(sys_rebuild_allowed(Some(now - Duration::from_secs(1)), now));
+        // Exakt på gränsen ska släppa igenom — annars fastnar en fångst som
+        // väntat klart tills nästa poll råkar hamna en tick senare.
+        let t = now + Duration::from_secs(5);
+        assert!(sys_rebuild_allowed(Some(t), t));
+    }
+
+    #[test]
+    fn backoff_vaxer_och_har_tak() {
+        let v: Vec<u64> = (0..8).map(|n| sys_retry_backoff(n).as_secs()).collect();
+        // Aldrig minskande — en längre felserie får aldrig ge tätare försök.
+        for w in v.windows(2) {
+            assert!(w[1] >= w[0], "backoffen minskade: {:?}", v);
+        }
+        // Taket håller: ett fel som aldrig går över kostar högst ett försök per
+        // 5 minuter, inte ett var 14:e sekund.
+        assert_eq!(*v.last().unwrap(), 300);
+        // Första försöket väntar kort — en tillfällig störning ska inte kosta
+        // användaren fem minuter utan mötesljud.
+        assert_eq!(v[1], 5);
+    }
 }

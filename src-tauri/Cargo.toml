@@ -14,7 +14,7 @@ name = "sagt"
 # strängen. Att hålla fältet utanför synken gjorde alltså inte problemet ofarligt — det
 # gjorde det osynligt. Rätt svar på en fil som måste vara i synk är att lägga den under
 # grinden, vilket den nu är.
-version = "0.10.0"
+version = "0.10.1"
 description = "A Tauri App"
 authors = ["you"]
 edition = "2021"
@@ -70,6 +70,10 @@ windows = { version = "0.61", features = [
 # Systemljud på macOS (mac_sysaudio.rs). objc2 och core-foundation finns redan
 # transitivt via cpal, men deklareras direkt här — en transitiv version är ingen
 # garanti och kan försvinna med en cpal-uppgradering.
+# dup2/pipe för filloggningen (applog.rs). Ingen stabil std-motsvarighet finns.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"
 objc2-foundation = { version = "0.3", features = ["NSString", "NSArray", "NSValue"] }
